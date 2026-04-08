@@ -1,6 +1,12 @@
 import datetime
 import copy
+from io import BytesIO
+
 import streamlit as st
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import mm
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
 
 from search_service import generate_query_options, sort_existing_papers_for_display
 from ats_pipeline import run_ats
@@ -221,6 +227,133 @@ SORT_MODES = [
     "Evidence strength",
     "Open access first",
 ]
+
+
+
+def _split_brief_into_sections(brief_text: str):
+    lines = [line.strip() for line in (brief_text or "").splitlines()]
+    sections = []
+    current_title = None
+    current_body = []
+
+    known_headings = {
+        "Research Brief",
+        "Bottom Line",
+        "What This Literature Actually Covers",
+        "Strongest Signals",
+        "Conceptual Framing",
+        "Methodological Reading",
+        "Where the Evidence Is Thin",
+        "Research Gaps",
+        "What This Means for Your Query",
+        "Best Next Directions",
+        "Confidence & Scope Note",
+    }
+
+    for line in lines:
+        if not line:
+            if current_body and current_body[-1] != "":
+                current_body.append("")
+            continue
+
+        if line in known_headings:
+            if current_title or current_body:
+                sections.append((current_title, "\n".join(current_body).strip()))
+            current_title = line
+            current_body = []
+        else:
+            current_body.append(line)
+
+    if current_title or current_body:
+        sections.append((current_title, "\n".join(current_body).strip()))
+
+    return sections
+
+
+def build_research_brief_pdf_bytes(brief_text: str, original_query: str = "", final_search_query: str = "") -> bytes:
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=18 * mm,
+        leftMargin=18 * mm,
+        topMargin=16 * mm,
+        bottomMargin=16 * mm,
+        title="Research Brief",
+    )
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "BriefTitle",
+        parent=styles["Title"],
+        fontName="Helvetica-Bold",
+        fontSize=20,
+        leading=24,
+        spaceAfter=10,
+        textColor="#1F2937",
+    )
+    meta_style = ParagraphStyle(
+        "BriefMeta",
+        parent=styles["BodyText"],
+        fontName="Helvetica",
+        fontSize=9.5,
+        leading=13,
+        spaceAfter=6,
+        textColor="#4B5563",
+    )
+    heading_style = ParagraphStyle(
+        "BriefHeading",
+        parent=styles["Heading2"],
+        fontName="Helvetica-Bold",
+        fontSize=12.5,
+        leading=15,
+        spaceBefore=8,
+        spaceAfter=5,
+        textColor="#2563EB",
+    )
+    body_style = ParagraphStyle(
+        "BriefBody",
+        parent=styles["BodyText"],
+        fontName="Helvetica",
+        fontSize=10.5,
+        leading=15,
+        spaceAfter=7,
+        textColor="#111827",
+    )
+
+    story = []
+    story.append(Paragraph("Research Brief", title_style))
+
+    if original_query:
+        story.append(Paragraph(f"<b>Original query:</b> {original_query}", meta_style))
+    if final_search_query:
+        story.append(Paragraph(f"<b>Final search query:</b> {final_search_query}", meta_style))
+    story.append(Spacer(1, 6))
+
+    sections = _split_brief_into_sections(brief_text)
+    for idx, (section_title, section_body) in enumerate(sections):
+        if section_title == "Research Brief" and not section_body:
+            continue
+
+        if section_title and section_title != "Research Brief":
+            story.append(Paragraph(section_title, heading_style))
+
+        paragraphs = [p.strip() for p in section_body.split("\n\n") if p.strip()] if section_body else []
+        for para in paragraphs:
+            para = para.replace("\n", "<br/>")
+            story.append(Paragraph(para, body_style))
+
+        if not section_title and section_body:
+            story.append(Paragraph(section_body.replace("\n", "<br/>"), body_style))
+
+        if idx < len(sections) - 1:
+            story.append(Spacer(1, 3))
+
+    if not sections and brief_text.strip():
+        story.append(Paragraph(brief_text.replace("\n", "<br/>"), body_style))
+
+    doc.build(story)
+    return buffer.getvalue()
 
 if "query_options_data" not in st.session_state:
     st.session_state.query_options_data = None
@@ -500,7 +633,25 @@ def render_final_brief(result: dict):
         st.info("Run Search 后，这里会显示最终的 Research Brief。")
     else:
         if result.get("editor"):
-            st.write(result.get("editor", ""))
+            brief_text = result.get("editor", "")
+            st.write(brief_text)
+
+            try:
+                pdf_bytes = build_research_brief_pdf_bytes(
+                    brief_text=brief_text,
+                    original_query=result.get("original_query", ""),
+                    final_search_query=result.get("final_search_query", ""),
+                )
+                st.download_button(
+                    label="Download Research Brief as PDF",
+                    data=pdf_bytes,
+                    file_name="research_brief.pdf",
+                    mime="application/pdf",
+                    use_container_width=False,
+                    key="download_research_brief_pdf",
+                )
+            except Exception as e:
+                st.caption(f"PDF export unavailable: {str(e)}")
         else:
             verifier = result.get("verifier", {}) or {}
             if verifier:
