@@ -51,9 +51,20 @@ def _safe_dict(value):
     return value if isinstance(value, dict) else {}
 
 
-def _run_structured_agent(prompt: str, fallback: dict):
+def _run_structured_agent(
+    prompt: str,
+    fallback: dict,
+    provider: str = "openai",
+    model: str | None = None,
+    max_tokens: int | None = None,
+):
     try:
-        raw = ask_llm(prompt)
+        raw = ask_llm(
+            prompt=prompt,
+            provider=provider,
+            model=model,
+            max_tokens=max_tokens,
+        )
         parsed = _extract_json(raw)
         if not isinstance(parsed, dict):
             return fallback
@@ -101,7 +112,13 @@ Rules:
         "uneven_zones": [],
         "narrative": ""
     }
-    parsed = _run_structured_agent(prompt, fallback)
+    parsed = _run_structured_agent(
+        prompt,
+        fallback,
+        provider="openai",
+        model="gpt-5.4-mini",
+        max_tokens=2200,
+    )
     return {
         "coverage_summary": _safe_text(parsed.get("coverage_summary")),
         "dominant_themes": _safe_list(parsed.get("dominant_themes")),
@@ -151,7 +168,13 @@ Rules:
         "blind_spots": [],
         "narrative": ""
     }
-    parsed = _run_structured_agent(prompt, fallback)
+    parsed = _run_structured_agent(
+        prompt,
+        fallback,
+        provider="openai",
+        model="gpt-5.4-mini",
+        max_tokens=2200,
+    )
     return {
         "core_frames": _safe_list(parsed.get("core_frames")),
         "distinctions": _safe_list(parsed.get("distinctions")),
@@ -211,7 +234,13 @@ Rules:
         "method_gaps": [],
         "narrative": ""
     }
-    parsed = _run_structured_agent(prompt, fallback)
+    parsed = _run_structured_agent(
+        prompt,
+        fallback,
+        provider="claude",
+        model="claude-sonnet-4-6",
+        max_tokens=2600,
+    )
     return {
         "dominant_study_types": _safe_list(parsed.get("dominant_study_types")),
         "evidence_profile": _safe_text(parsed.get("evidence_profile")),
@@ -274,7 +303,13 @@ Rules:
         "weak_zones": [],
         "narrative": ""
     }
-    parsed = _run_structured_agent(prompt, fallback)
+    parsed = _run_structured_agent(
+        prompt,
+        fallback,
+        provider="claude",
+        model="claude-sonnet-4-6",
+        max_tokens=2600,
+    )
     return {
         "overstatement_risks": _safe_list(parsed.get("overstatement_risks")),
         "scope_biases": _safe_list(parsed.get("scope_biases")),
@@ -343,7 +378,13 @@ Rules:
         "next_research_needs": [],
         "narrative": ""
     }
-    parsed = _run_structured_agent(prompt, fallback)
+    parsed = _run_structured_agent(
+        prompt,
+        fallback,
+        provider="openai",
+        model="gpt-5.4-mini",
+        max_tokens=2200,
+    )
     return {
         "topic_gaps": _safe_list(parsed.get("topic_gaps")),
         "population_or_context_gaps": _safe_list(parsed.get("population_or_context_gaps")),
@@ -419,7 +460,13 @@ Rules:
         "confidence_reason": "",
         "narrative": ""
     }
-    parsed = _run_structured_agent(prompt, fallback)
+    parsed = _run_structured_agent(
+        prompt,
+        fallback,
+        provider="openai",
+        model="gpt-5.4-mini",
+        max_tokens=2200,
+    )
     return {
         "strongly_supported": _safe_list(parsed.get("strongly_supported")),
         "moderately_supported": _safe_list(parsed.get("moderately_supported")),
@@ -527,6 +574,11 @@ Style rules:
 - Professional and direct
 """
     try:
-        return ask_llm(prompt).strip()
+        return ask_llm(
+            prompt,
+            provider="openai",
+            model="gpt-5.4-mini",
+            max_tokens=2600,
+        ).strip()
     except Exception as e:
         return f"Error: {str(e)}"

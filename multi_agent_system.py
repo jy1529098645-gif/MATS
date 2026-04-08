@@ -1,6 +1,7 @@
 import json
 import re
 import difflib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List
 
 import streamlit as st
@@ -246,12 +247,26 @@ def direct_ratio(papers: List[dict]) -> float:
     return direct_like / max(1, len(papers))
 
 
-def add_trace(state: dict, agent_name: str, action: str, details: str = ""):
-    state.setdefault("trace", []).append({
+def add_trace(state: dict, agent_name: str, action: str, details: str = "", progress_callback=None):
+    entry = {
         "agent": agent_name,
         "action": action,
         "details": details,
-    })
+    }
+    state.setdefault("trace", []).append(entry)
+
+    if progress_callback:
+        _emit(
+            progress_callback,
+            state.get("metrics", {}).get("step_count", 0),
+            f"{agent_name}: {action}...",
+            payload={
+                "type": "workflow",
+                "agent": agent_name,
+                "action": action,
+                "details": details,
+            }
+        )
 
 
 def pop_next_task(state: dict):
@@ -270,6 +285,7 @@ def clear_downstream_outputs_after_retrieval(state: dict):
     state["gap_analyst"] = {}
     state["verifier"] = {}
     state["editor"] = ""
+    state["flags"]["analysis_bundle_done"] = False
 
 
 @st.cache_data(ttl=60 * 20, show_spinner=False)
@@ -677,6 +693,7 @@ def create_initial_state(
             "planner_review_done": False,
             "retrieval_done": False,
             "retrieval_refined": False,
+            "analysis_bundle_done": False,
             "done": False,
         },
         "tasks": [
@@ -706,7 +723,8 @@ def query_planner_initial_agent(state: dict, progress_callback=None) -> dict:
         state,
         "QueryPlannerAgent",
         "plan_initial",
-        f"query_type={result.get('query_type', '')}, search_focus={result.get('search_focus', '')}"
+        f"query_type={result.get('query_type', '')}, search_focus={result.get('search_focus', '')}",
+        progress_callback=progress_callback,
     )
     return state
 
@@ -742,7 +760,8 @@ def query_planner_review_agent(state: dict, progress_callback=None) -> dict:
         state,
         "QueryPlannerAgent",
         "plan_review",
-        f"retrieval_assessment={result.get('retrieval_assessment', '')}, should_refine={result.get('should_refine', False)}"
+        f"retrieval_assessment={result.get('retrieval_assessment', '')}, should_refine={result.get('should_refine', False)}",
+        progress_callback=progress_callback,
     )
     return state
 
@@ -813,7 +832,8 @@ def retrieval_agent(state: dict, progress_callback=None, refinement: bool = Fals
         state,
         "RetrievalAgent",
         "retrieve_refined" if refinement else "retrieve",
-        f"papers={len(deduped_papers)}, duplicates_removed={duplicates_removed}, strict_core_only={settings.get('strict_core_only', False)}"
+        f"papers={len(deduped_papers)}, duplicates_removed={duplicates_removed}, strict_core_only={settings.get('strict_core_only', False)}",
+        progress_callback=progress_callback,
     )
 
     if refinement:
@@ -831,7 +851,7 @@ def researcher_agent(state: dict, progress_callback=None) -> dict:
         paper_text
     )
     state["researcher"] = result
-    add_trace(state, "ResearcherAgent", "analyze", "literature coverage and dominant themes")
+    add_trace(state, "ResearcherAgent", "analyze", "literature coverage and dominant themes", progress_callback=progress_callback)
     return state
 
 
@@ -845,7 +865,7 @@ def theorist_agent(state: dict, progress_callback=None) -> dict:
         _safe_json_dumps(state.get("researcher", {}))
     )
     state["theorist"] = result
-    add_trace(state, "TheoristAgent", "analyze", "conceptual framing and tensions")
+    add_trace(state, "TheoristAgent", "analyze", "conceptual framing and tensions", progress_callback=progress_callback)
     return state
 
 
@@ -860,7 +880,7 @@ def methodologist_agent(state: dict, progress_callback=None) -> dict:
         _safe_json_dumps(state.get("theorist", {}))
     )
     state["methodologist"] = result
-    add_trace(state, "MethodologistAgent", "analyze", "study types, evidence profile, method gaps")
+    add_trace(state, "MethodologistAgent", "analyze", "study types, evidence profile, method gaps", progress_callback=progress_callback)
     return state
 
 
@@ -876,7 +896,7 @@ def critic_agent(state: dict, progress_callback=None) -> dict:
         _safe_json_dumps(state.get("methodologist", {}))
     )
     state["critic"] = result
-    add_trace(state, "CriticAgent", "analyze", "weak zones, bias, off-target patterns")
+    add_trace(state, "CriticAgent", "analyze", "weak zones, bias, off-target patterns", progress_callback=progress_callback)
     return state
 
 
@@ -893,7 +913,7 @@ def gap_agent(state: dict, progress_callback=None) -> dict:
         _safe_json_dumps(state.get("critic", {}))
     )
     state["gap_analyst"] = result
-    add_trace(state, "GapAgent", "analyze", "topic, conceptual and methodological gaps")
+    add_trace(state, "GapAgent", "analyze", "topic, conceptual and methodological gaps", progress_callback=progress_callback)
     return state
 
 
@@ -911,7 +931,154 @@ def verifier_agent(state: dict, progress_callback=None) -> dict:
         _safe_json_dumps(state.get("gap_analyst", {}))
     )
     state["verifier"] = result
-    add_trace(state, "VerifierAgent", "analyze", f"confidence={result.get('confidence_level', 'Medium')}")
+    add_trace(state, "VerifierAgent", "analyze", f"confidence={result.get('confidence_level', 'Medium')}", progress_callback=progress_callback)
+    return state
+
+
+def _run_parallel_job(job_name: str, fn):
+    return fn()
+
+
+def parallel_analysis_agent(state: dict, progress_callback=None) -> dict:
+    papers = state.get("papers", [])
+    paper_text = build_paper_text(papers)
+    # Always run Theorist if the UI exposes a dedicated Theorist panel.
+    # Otherwise users see an empty block when planner heuristics skip it.
+    should_use_theorist = True
+
+    _emit(progress_callback, 90, "Parallel analysis wave 1/3: Researcher and Methodologist...")
+
+    wave1_jobs = {
+        "researcher": lambda: run_researcher(
+            state["original_query"],
+            state["final_search_query"],
+            paper_text,
+        ),
+        "methodologist": lambda: run_methodologist(
+            state["original_query"],
+            state["final_search_query"],
+            paper_text,
+            {},
+            {},
+        ),
+    }
+
+    wave1_results = {}
+    with ThreadPoolExecutor(max_workers=len(wave1_jobs)) as executor:
+        future_map = {
+            executor.submit(_run_parallel_job, job_name, fn): job_name
+            for job_name, fn in wave1_jobs.items()
+        }
+        for future in as_completed(future_map):
+            job_name = future_map[future]
+            try:
+                wave1_results[job_name] = future.result()
+            except Exception as e:
+                raise RuntimeError(f"Parallel wave 1 failed in {job_name}: {e}") from e
+
+    state["researcher"] = wave1_results.get("researcher", {})
+    state["methodologist"] = wave1_results.get("methodologist", {})
+    add_trace(state, "ResearcherAgent", "parallel_complete", "wave1 parallel analysis complete", progress_callback=progress_callback)
+    add_trace(state, "MethodologistAgent", "parallel_complete", "wave1 parallel analysis complete", progress_callback=progress_callback)
+
+    if should_use_theorist:
+        _emit(progress_callback, 92, "Parallel analysis wave 2/3: Theorist and Critic...")
+
+        wave2_jobs = {
+            "theorist": lambda: run_theorist(
+                state["original_query"],
+                state["final_search_query"],
+                paper_text,
+                state.get("researcher", {}),
+            ),
+            "critic": lambda: run_critic(
+                state["original_query"],
+                state["final_search_query"],
+                paper_text,
+                state.get("researcher", {}),
+                {},
+                state.get("methodologist", {}),
+            ),
+        }
+    else:
+        _emit(progress_callback, 92, "Parallel analysis wave 2/3: Critic...")
+        wave2_jobs = {
+            "critic": lambda: run_critic(
+                state["original_query"],
+                state["final_search_query"],
+                paper_text,
+                state.get("researcher", {}),
+                {},
+                state.get("methodologist", {}),
+            ),
+        }
+
+    wave2_results = {}
+    with ThreadPoolExecutor(max_workers=len(wave2_jobs)) as executor:
+        future_map = {
+            executor.submit(_run_parallel_job, job_name, fn): job_name
+            for job_name, fn in wave2_jobs.items()
+        }
+        for future in as_completed(future_map):
+            job_name = future_map[future]
+            try:
+                wave2_results[job_name] = future.result()
+            except Exception as e:
+                raise RuntimeError(f"Parallel wave 2 failed in {job_name}: {e}") from e
+
+    if should_use_theorist:
+        state["theorist"] = wave2_results.get("theorist", {})
+        add_trace(state, "TheoristAgent", "parallel_complete", "wave2 parallel analysis complete", progress_callback=progress_callback)
+    else:
+        state["theorist"] = {}
+
+    state["critic"] = wave2_results.get("critic", {})
+    add_trace(state, "CriticAgent", "parallel_complete", "wave2 parallel analysis complete", progress_callback=progress_callback)
+
+    _emit(progress_callback, 95, "Parallel analysis wave 3/3: Gap Analyst and Verifier...")
+
+    wave3_jobs = {
+        "gap_analyst": lambda: run_gap_analyst(
+            state["original_query"],
+            state["final_search_query"],
+            paper_text,
+            state.get("researcher", {}),
+            state.get("theorist", {}),
+            state.get("methodologist", {}),
+            state.get("critic", {}),
+        ),
+        "verifier": lambda: run_verifier(
+            state["original_query"],
+            state["final_search_query"],
+            paper_text,
+            state.get("researcher", {}),
+            state.get("theorist", {}),
+            state.get("methodologist", {}),
+            state.get("critic", {}),
+            {},
+        ),
+    }
+
+    wave3_results = {}
+    with ThreadPoolExecutor(max_workers=len(wave3_jobs)) as executor:
+        future_map = {
+            executor.submit(_run_parallel_job, job_name, fn): job_name
+            for job_name, fn in wave3_jobs.items()
+        }
+        for future in as_completed(future_map):
+            job_name = future_map[future]
+            try:
+                wave3_results[job_name] = future.result()
+            except Exception as e:
+                raise RuntimeError(f"Parallel wave 3 failed in {job_name}: {e}") from e
+
+    state["gap_analyst"] = wave3_results.get("gap_analyst", {})
+    state["verifier"] = wave3_results.get("verifier", {})
+    add_trace(state, "GapAgent", "parallel_complete", "wave3 parallel analysis complete", progress_callback=progress_callback)
+    add_trace(state, "VerifierAgent", "parallel_complete", f"wave3 parallel analysis complete, confidence={state['verifier'].get('confidence_level', 'Medium')}", progress_callback=progress_callback)
+
+    state["flags"]["analysis_bundle_done"] = True
+    add_trace(state, "ParallelAnalysisAgent", "complete", "post-retrieval analysis bundle finished", progress_callback=progress_callback)
     return state
 
 
@@ -933,7 +1100,7 @@ def editor_agent(state: dict, progress_callback=None) -> dict:
         _safe_json_dumps(strategy_summary),
     )
     state["editor"] = result
-    add_trace(state, "EditorAgent", "synthesize", "final brief built")
+    add_trace(state, "EditorAgent", "synthesize", "final brief built", progress_callback=progress_callback)
     return state
 
 
@@ -1038,36 +1205,18 @@ def router_agent(state: dict) -> dict:
     if not papers:
         return {"type": "finish", "reason": "no papers found", "priority": 999}
 
-    # retrieval 之后必须让 planner 二次出场
     if not state["flags"].get("planner_review_done", False):
         return {"type": "query_planner_review", "reason": "post-retrieval review missing", "priority": 15}
 
     if should_refine_retrieval(state):
         return {"type": "retrieve_refinement", "reason": "query planner or metrics recommend refinement", "priority": 18}
 
-    if not state.get("researcher"):
-        return {"type": "researcher", "reason": "coverage analysis missing", "priority": 20}
+    if not state["flags"].get("analysis_bundle_done", False):
+        return {"type": "analysis_parallel", "reason": "post-retrieval multi-agent analysis not done", "priority": 20}
 
-    if not state.get("theorist") and should_run_theorist(state):
-        return {"type": "theorist", "reason": "conceptual reading needed", "priority": 30}
-
-    if not state.get("methodologist"):
-        return {"type": "methodologist", "reason": "method reading missing", "priority": 40}
-
-    if not state.get("critic"):
-        return {"type": "critic", "reason": "critical reading warranted", "priority": 50}
-
-    # critic 真正能触发 refinement
     if critic_requests_refinement(state):
         return {"type": "retrieve_refinement", "reason": "critic found scope / off-target issues", "priority": 56}
 
-    if not state.get("gap_analyst"):
-        return {"type": "gap_analyst", "reason": "gap analysis missing", "priority": 60}
-
-    if not state.get("verifier"):
-        return {"type": "verifier", "reason": "confidence verification missing", "priority": 70}
-
-    # verifier 真正能阻止 editor，并强制 refinement
     if verifier_blocks_editor(state):
         if not state["flags"].get("retrieval_refined", False):
             return {"type": "retrieve_refinement", "reason": "verifier blocked editor due to weak confidence", "priority": 75}
@@ -1090,6 +1239,8 @@ def execute_task(state: dict, task: dict, progress_callback=None) -> dict:
         return retrieval_agent(state, progress_callback=progress_callback, refinement=False)
     if task_type == "retrieve_refinement":
         return retrieval_agent(state, progress_callback=progress_callback, refinement=True)
+    if task_type == "analysis_parallel":
+        return parallel_analysis_agent(state, progress_callback=progress_callback)
     if task_type == "researcher":
         return researcher_agent(state, progress_callback=progress_callback)
     if task_type == "theorist":
@@ -1106,11 +1257,11 @@ def execute_task(state: dict, task: dict, progress_callback=None) -> dict:
         return editor_agent(state, progress_callback=progress_callback)
     if task_type == "finish":
         state["flags"]["done"] = True
-        add_trace(state, "RouterAgent", "finish", task.get("reason", ""))
+        add_trace(state, "RouterAgent", "finish", task.get("reason", ""), progress_callback=progress_callback)
         return state
 
     state["flags"]["done"] = True
-    add_trace(state, "RouterAgent", "finish", f"unknown task={task_type}")
+    add_trace(state, "RouterAgent", "finish", f"unknown task={task_type}", progress_callback=progress_callback)
     return state
 
 
@@ -1141,17 +1292,24 @@ def run_multi_agent_collaboration(
         source_filters=source_filters,
     )
 
-    add_trace(state, "RouterAgent", "start", "multi-agent collaboration started")
+    add_trace(state, "RouterAgent", "start", "multi-agent collaboration started", progress_callback=progress_callback)
 
     while not state["flags"].get("done", False) and state["metrics"]["step_count"] < max_steps:
         state["metrics"]["step_count"] += 1
 
         task = router_agent(state)
+        route_details = f"step={state['metrics']['step_count']}, next={task.get('type')}, reason={task.get('reason', '')}"
         add_trace(
             state,
             "RouterAgent",
             "route",
-            f"step={state['metrics']['step_count']}, next={task.get('type')}, reason={task.get('reason', '')}"
+            route_details,
+            progress_callback=progress_callback,
+        )
+        _emit(
+            progress_callback,
+            0,
+            f"RouterAgent: routing to {task.get('type')}..."
         )
         state = execute_task(state, task, progress_callback=progress_callback)
 

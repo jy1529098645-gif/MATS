@@ -1136,6 +1136,258 @@ def llm_rerank_batch(
         return []
 
 
+def adversarial_batch_prompt(original_query: str, retrieval_query: str, intent_profile: dict, papers: list):
+    intent_profile = intent_profile or {}
+    formatted = []
+
+    for idx, paper in enumerate(papers, start=1):
+        llm_meta = paper.get("_llm_meta", {}) or {}
+        formatted.append(
+            f"""
+Paper {idx}
+Title: {paper.get('title', '')}
+Authors: {paper.get('authors', '')}
+Year: {paper.get('year', '')}
+Source: {paper.get('source', '')}
+OpenAccess: {paper.get('is_oa', False)}
+Abstract: {truncate_text(paper.get('summary', ''), 1100)}
+Selector fit score: {llm_meta.get('research_fit_score', 55)}
+Selector domain fit: {llm_meta.get('domain_fit_label', 'adjacent')}
+Selector paper type: {llm_meta.get('paper_type_label', 'theory/other')}
+Selector abstract quality: {llm_meta.get('abstract_quality_label', 'limited')}
+Selector off-target risk: {llm_meta.get('off_target_risk_score', 40)}
+Selector reason: {llm_meta.get('reason', '')}
+"""
+        )
+
+    papers_block = "\n".join(formatted)
+
+    return f"""
+You are running an adversarial academic screening layer.
+
+Original user topic:
+{original_query}
+
+Retrieval query:
+{retrieval_query}
+
+Intent profile:
+{json.dumps(intent_profile, ensure_ascii=False)}
+
+Task:
+For each paper, simulate a structured debate between three roles:
+1. SelectorAgent — argues for keeping the paper
+2. CriticAgent — tries to reject the paper by finding off-target, weak-support, or domain mismatch issues
+3. ArbiterAgent — makes the final decision
+
+Final decision must be one of:
+- keep
+- uncertain
+- reject
+
+Use these principles:
+- Missing abstract should strongly hurt borderline papers
+- Adjacent or off-target domain papers should be rejected unless they clearly provide necessary background
+- Technical method / framework papers should be penalized when the user is asking about substantive research findings rather than tooling
+- Do not reward mere keyword overlap
+
+Return JSON only in this exact format:
+{{
+  "papers": [
+    {{
+      "paper_index": 1,
+      "selector_decision": "keep",
+      "selector_reason": "...",
+      "critic_decision": "reject",
+      "critic_reason": "...",
+      "arbiter_decision": "uncertain",
+      "arbiter_reason": "...",
+      "debate_severity": "low",
+      "confidence": 0.73
+    }}
+  ]
+}}
+
+Rules:
+- Reasons must be short, concrete, and evidence-aware
+- debate_severity must be one of: low / medium / high
+- confidence must be between 0 and 1
+- Return valid JSON only
+
+Papers:
+{papers_block}
+"""
+
+
+@st.cache_data(ttl=60 * 30, show_spinner=False)
+def run_adversarial_batch(
+    original_query: str,
+    retrieval_query: str,
+    intent_profile_json: str,
+    batch_json: str,
+):
+    try:
+        intent_profile = json.loads(intent_profile_json) if intent_profile_json else {}
+    except Exception:
+        intent_profile = {}
+
+    papers = json.loads(batch_json) if batch_json else []
+    prompt = adversarial_batch_prompt(
+        original_query=original_query,
+        retrieval_query=retrieval_query,
+        intent_profile=intent_profile,
+        papers=papers,
+    )
+
+    try:
+        raw = ask_llm(prompt)
+        parsed = safe_json_loads(raw)
+        items = parsed.get("papers", [])
+        if not isinstance(items, list):
+            return []
+
+        normalized = []
+        for item in items:
+            idx = item.get("paper_index")
+            if not isinstance(idx, int):
+                continue
+
+            selector_decision = str(item.get("selector_decision", "uncertain")).strip().lower()
+            critic_decision = str(item.get("critic_decision", "uncertain")).strip().lower()
+            arbiter_decision = str(item.get("arbiter_decision", "uncertain")).strip().lower()
+            debate_severity = str(item.get("debate_severity", "medium")).strip().lower()
+
+            if selector_decision not in ["keep", "uncertain", "reject"]:
+                selector_decision = "uncertain"
+            if critic_decision not in ["keep", "uncertain", "reject"]:
+                critic_decision = "uncertain"
+            if arbiter_decision not in ["keep", "uncertain", "reject"]:
+                arbiter_decision = "uncertain"
+            if debate_severity not in ["low", "medium", "high"]:
+                debate_severity = "medium"
+
+            try:
+                confidence = float(item.get("confidence", 0.65))
+            except Exception:
+                confidence = 0.65
+            confidence = max(0.0, min(1.0, confidence))
+
+            normalized.append({
+                "paper_index": idx,
+                "selector_decision": selector_decision,
+                "selector_reason": truncate_text(str(item.get("selector_reason", "")).strip(), 180),
+                "critic_decision": critic_decision,
+                "critic_reason": truncate_text(str(item.get("critic_reason", "")).strip(), 180),
+                "arbiter_decision": arbiter_decision,
+                "arbiter_reason": truncate_text(str(item.get("arbiter_reason", "")).strip(), 180),
+                "debate_severity": debate_severity,
+                "confidence": confidence,
+            })
+
+        return normalized
+    except Exception:
+        return []
+
+
+def run_adversarial_screening(
+    original_query: str,
+    retrieval_query: str,
+    candidates: list,
+    intent_profile=None,
+    progress_callback=None,
+    progress_start: float = 72,
+    progress_end: float = 82,
+):
+    if not candidates:
+        return [], []
+
+    intent_profile = normalize_intent_profile(intent_profile)
+    batch_size = 5
+    total_batches = max(1, (len(candidates) + batch_size - 1) // batch_size)
+    debate_trace = []
+    enriched = []
+
+    for batch_idx, start in enumerate(range(0, len(candidates), batch_size), start=1):
+        batch = candidates[start:start + batch_size]
+        progress_value = progress_start + ((batch_idx - 1) / total_batches) * (progress_end - progress_start)
+        emit_progress(
+            progress_callback,
+            progress_value,
+            f"Adversarial screening batch {batch_idx}/{total_batches}..."
+        )
+
+        compact_batch = []
+        for p in batch:
+            compact_batch.append({
+                "title": p.get("title", ""),
+                "authors": p.get("authors", ""),
+                "year": p.get("year", ""),
+                "source": p.get("source", ""),
+                "summary": p.get("summary", ""),
+                "is_oa": p.get("is_oa", False),
+                "_llm_meta": p.get("_llm_meta", {}),
+            })
+
+        batch_results = run_adversarial_batch(
+            original_query=original_query,
+            retrieval_query=retrieval_query,
+            intent_profile_json=json.dumps(intent_profile, sort_keys=True, ensure_ascii=False),
+            batch_json=json.dumps(compact_batch, sort_keys=True, ensure_ascii=False),
+        )
+
+        mapped = {}
+        for item in batch_results:
+            paper_index = item.get("paper_index")
+            if isinstance(paper_index, int) and 1 <= paper_index <= len(batch):
+                mapped[paper_index - 1] = item
+
+        batch_live_entries = []
+        for local_idx, p in enumerate(batch):
+            adv = mapped.get(local_idx)
+            if adv is None:
+                adv = {
+                    "selector_decision": "keep",
+                    "selector_reason": "Initial selector pass found enough topical support.",
+                    "critic_decision": "uncertain",
+                    "critic_reason": "No decisive rejection signal was found in the adversarial pass.",
+                    "arbiter_decision": "uncertain",
+                    "arbiter_reason": "Borderline paper kept in reserve because the debate was inconclusive.",
+                    "debate_severity": "medium",
+                    "confidence": 0.58,
+                }
+
+            p_copy = dict(p)
+            p_copy["adversarial_screening"] = adv
+            enriched.append(p_copy)
+
+            entry = {
+                "title": p.get("title", "Untitled"),
+                "selector_decision": adv.get("selector_decision", "uncertain"),
+                "selector_reason": adv.get("selector_reason", ""),
+                "critic_decision": adv.get("critic_decision", "uncertain"),
+                "critic_reason": adv.get("critic_reason", ""),
+                "arbiter_decision": adv.get("arbiter_decision", "uncertain"),
+                "arbiter_reason": adv.get("arbiter_reason", ""),
+                "debate_severity": adv.get("debate_severity", "medium"),
+                "confidence": adv.get("confidence", 0.0),
+            }
+            debate_trace.append(entry)
+            batch_live_entries.append(entry)
+
+        emit_progress(
+            progress_callback,
+            min(progress_end, progress_value + 1),
+            f"Adversarial screening batch {batch_idx}/{total_batches} resolved.",
+            payload={
+                "event_type": "adversarial_trace",
+                "entries": batch_live_entries,
+            }
+        )
+
+    emit_progress(progress_callback, progress_end, "Adversarial screening complete.")
+    return enriched, debate_trace
+
+
 def enrich_candidates_with_llm_scores(
     original_query: str,
     retrieval_query: str,
@@ -1223,6 +1475,7 @@ def combine_rule_and_llm_scores(
     rule_score = float(paper.get("_rule_score", 0))
     llm_meta = paper.get("_llm_meta", {}) or {}
     features = paper.get("_rule_features", {}) or {}
+    adversarial = paper.get("adversarial_screening", {}) or {}
 
     research_fit_score = float(llm_meta.get("research_fit_score", 55))
     off_target_risk_score = float(llm_meta.get("off_target_risk_score", 40))
@@ -1315,6 +1568,22 @@ def combine_rule_and_llm_scores(
         short_query_focus_bonus += positive_hits * 1.2
         short_query_focus_penalty += negative_hits * 2.3
 
+    arbiter_decision = str(adversarial.get("arbiter_decision", "uncertain")).lower()
+    debate_severity = str(adversarial.get("debate_severity", "medium")).lower()
+    confidence = float(adversarial.get("confidence", 0.6) or 0.6)
+    adversarial_adjustment = 0
+    if arbiter_decision == "keep":
+        adversarial_adjustment += 10 + confidence * 8
+    elif arbiter_decision == "uncertain":
+        adversarial_adjustment -= 4
+    elif arbiter_decision == "reject":
+        adversarial_adjustment -= 28 - confidence * 6
+
+    if debate_severity == "high":
+        adversarial_adjustment -= 6
+    elif debate_severity == "low":
+        adversarial_adjustment += 2
+
     if sort_mode == "Research fit":
         final_score = (
             research_fit_score * 0.90
@@ -1326,6 +1595,7 @@ def combine_rule_and_llm_scores(
             + oa_bonus
             + short_query_focus_bonus
             - short_query_focus_penalty
+            + adversarial_adjustment
         )
     elif sort_mode == "Evidence strength":
         final_score = (
@@ -1336,6 +1606,7 @@ def combine_rule_and_llm_scores(
             + domain_adjustment
             + abstract_adjustment
             + oa_bonus
+            + adversarial_adjustment
         )
     elif sort_mode == "Relevance score":
         final_score = (
@@ -1351,6 +1622,7 @@ def combine_rule_and_llm_scores(
             + oa_bonus
             + short_query_focus_bonus
             - short_query_focus_penalty
+            + adversarial_adjustment
         )
     elif sort_mode == "Newest first":
         final_score = (
@@ -1362,6 +1634,7 @@ def combine_rule_and_llm_scores(
             + domain_adjustment
             + abstract_adjustment
             + oa_bonus
+            + adversarial_adjustment
         )
     elif sort_mode == "Open access first":
         final_score = (
@@ -1377,6 +1650,7 @@ def combine_rule_and_llm_scores(
             + oa_bonus
             + short_query_focus_bonus
             - short_query_focus_penalty
+            + adversarial_adjustment
         )
     else:
         final_score = (
@@ -1392,6 +1666,7 @@ def combine_rule_and_llm_scores(
             + oa_bonus
             + short_query_focus_bonus
             - short_query_focus_penalty
+            + adversarial_adjustment
         )
 
     return round(final_score, 2)
@@ -1401,6 +1676,11 @@ def classify_gate_bucket(paper: dict):
     domain_fit = str(paper.get("domain_fit_label", "adjacent")).lower()
     abstract_quality = str(paper.get("abstract_quality_label", "limited")).lower()
     has_abs = abstract_quality != "missing" and has_good_abstract(paper.get("summary", ""))
+    adversarial = paper.get("adversarial_screening", {}) or {}
+    arbiter_decision = str(adversarial.get("arbiter_decision", "uncertain")).lower()
+
+    if arbiter_decision == "reject":
+        return "arbiter_reject"
 
     if domain_fit in ["direct", "mostly direct"] and has_abs:
         return "primary"
@@ -1434,6 +1714,7 @@ def apply_post_filter_gate(finalized: list, paper_count: int, strict_core_only: 
     adjacent_missing_abstract = []
     off_target_with_abstract = []
     off_target_missing_abstract = []
+    arbiter_reject = []
 
     for p in finalized:
         bucket = classify_gate_bucket(p)
@@ -1449,6 +1730,8 @@ def apply_post_filter_gate(finalized: list, paper_count: int, strict_core_only: 
             adjacent_missing_abstract.append(p)
         elif bucket == "off_target_with_abstract":
             off_target_with_abstract.append(p)
+        elif bucket == "arbiter_reject":
+            arbiter_reject.append(p)
         else:
             off_target_missing_abstract.append(p)
 
@@ -1483,6 +1766,7 @@ def apply_post_filter_gate(finalized: list, paper_count: int, strict_core_only: 
         adjacent_missing_abstract,
         off_target_with_abstract,
         off_target_missing_abstract,
+        arbiter_reject,
     ]
 
     for bucket in fill_order:
@@ -1748,14 +2032,24 @@ def search_papers_with_diagnostics_live(
         progress_end=72,
     )
 
+    llm_enriched, adversarial_trace = run_adversarial_screening(
+        original_query=original_query or query,
+        retrieval_query=query,
+        candidates=llm_enriched,
+        intent_profile=intent_profile,
+        progress_callback=progress_callback,
+        progress_start=72,
+        progress_end=82,
+    )
+
     if open_access_only:
-        emit_progress(progress_callback, 74, "Applying open-access-only filter to shortlisted papers...")
+        emit_progress(progress_callback, 83, "Applying open-access-only filter to shortlisted papers...")
         llm_enriched = [p for p in llm_enriched if p.get("is_oa", False)]
 
     if strict_core_only:
-        emit_progress(progress_callback, 78, "Applying strict core-paper prioritization...")
+        emit_progress(progress_callback, 84, "Applying strict core-paper prioritization...")
     else:
-        emit_progress(progress_callback, 78, "Building final ranked shortlist...")
+        emit_progress(progress_callback, 84, "Building final ranked shortlist...")
 
     final_ranked = finalize_ranked_papers(
         candidates=llm_enriched,
@@ -1768,7 +2062,7 @@ def search_papers_with_diagnostics_live(
         strict_core_only=strict_core_only,
     )
 
-    emit_progress(progress_callback, 84, "Filling any remaining slots from supplementary candidates if needed...")
+    emit_progress(progress_callback, 87, "Filling any remaining slots from supplementary candidates if needed...")
     final_ranked = supplement_ranked_papers(
         final_ranked=final_ranked,
         rule_ranked=rule_ranked,
@@ -1826,6 +2120,12 @@ def search_papers_with_diagnostics_live(
     if prefer_abstracts:
         selection_logic.append("Prefer-abstracts mode penalized papers with missing or weak abstracts.")
 
+    adversarial_summary = {
+        "keep": sum(1 for x in adversarial_trace if x.get("arbiter_decision") == "keep"),
+        "uncertain": sum(1 for x in adversarial_trace if x.get("arbiter_decision") == "uncertain"),
+        "reject": sum(1 for x in adversarial_trace if x.get("arbiter_decision") == "reject"),
+    }
+
     diagnostics = {
         "retrieval_funnel": {
             "retrieved_total": len(all_candidates),
@@ -1836,9 +2136,11 @@ def search_papers_with_diagnostics_live(
         "retained_examples": retained_examples,
         "pushed_down_examples": pushed_down_examples,
         "selection_logic": selection_logic,
+        "adversarial_trace": adversarial_trace,
+        "adversarial_summary": adversarial_summary,
     }
 
-    emit_progress(progress_callback, 86, "Retrieval and ranking complete.")
+    emit_progress(progress_callback, 89, "Retrieval and ranking complete.")
 
     return {
         "papers": final_ranked[:paper_count],
