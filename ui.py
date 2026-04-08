@@ -22,9 +22,9 @@ st.set_page_config(
 BASE_DIR = Path(__file__).resolve().parent
 logo_path = BASE_DIR / "Picture" / "LOGO4.png"
 
-st.caption(f"BASE_DIR = {BASE_DIR}")
-st.caption(f"Trying logo path = {logo_path}")
-st.caption(f"Logo exists = {logo_path.exists()}")
+#st.caption(f"BASE_DIR = {BASE_DIR}")
+#st.caption(f"Trying logo path = {logo_path}")
+#st.caption(f"Logo exists = {logo_path.exists()}")
 
 if logo_path.exists():
     st.image(str(logo_path), width=200)
