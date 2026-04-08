@@ -129,7 +129,7 @@ Rules:
     }
 
 
-def run_theorist(query: str, final_search_query: str, paper_text: str, researcher_output: dict) -> dict:
+def run_theorist(query: str, final_search_query: str, paper_text: str, researcher_output: dict | None = None) -> dict:
     prompt = f"""
 You are a conceptual and theoretical analyst.
 
@@ -142,11 +142,13 @@ Final search query:
 Retrieved paper summaries and metadata:
 {paper_text}
 
-Researcher output:
-{json.dumps(researcher_output, ensure_ascii=False)}
-
 Task:
 Return a structured conceptual reading of the literature.
+
+Important independence rule:
+- Work directly from the retrieved paper summaries and metadata.
+- Do not rely on or be influenced by other agent outputs.
+- Treat this as an independent conceptual reading of the same evidence set.
 
 Return JSON only in this format:
 {{
@@ -188,8 +190,8 @@ def run_methodologist(
     query: str,
     final_search_query: str,
     paper_text: str,
-    researcher_output: dict,
-    theorist_output: dict
+    researcher_output: dict | None = None,
+    theorist_output: dict | None = None
 ) -> dict:
     prompt = f"""
 You are a methodology reviewer.
@@ -203,14 +205,13 @@ Final search query:
 Retrieved paper summaries and metadata:
 {paper_text}
 
-Researcher output:
-{json.dumps(researcher_output, ensure_ascii=False)}
-
-Theorist output:
-{json.dumps(theorist_output, ensure_ascii=False)}
-
 Task:
 Return a structured methodological reading.
+
+Important independence rule:
+- Work directly from the retrieved paper summaries and metadata.
+- Do not rely on or be influenced by other agent outputs.
+- Treat this as an independent methodological reading of the same evidence set.
 
 Return JSON only in this format:
 {{
@@ -255,9 +256,9 @@ def run_critic(
     query: str,
     final_search_query: str,
     paper_text: str,
-    researcher_output: dict,
-    theorist_output: dict,
-    methodologist_output: dict
+    researcher_output: dict | None = None,
+    theorist_output: dict | None = None,
+    methodologist_output: dict | None = None
 ) -> dict:
     prompt = f"""
 You are a critical academic reviewer.
@@ -271,17 +272,13 @@ Final search query:
 Retrieved paper summaries and metadata:
 {paper_text}
 
-Researcher output:
-{json.dumps(researcher_output, ensure_ascii=False)}
-
-Theorist output:
-{json.dumps(theorist_output, ensure_ascii=False)}
-
-Methodologist output:
-{json.dumps(methodologist_output, ensure_ascii=False)}
-
 Task:
 Return a structured critical assessment.
+
+Important independence rule:
+- Work directly from the retrieved paper summaries and metadata.
+- Do not rely on or be influenced by other agent outputs.
+- Treat this as an independent critical reading of the same evidence set.
 
 Return JSON only in this format:
 {{
@@ -354,6 +351,11 @@ Critic output:
 
 Task:
 Return meaningful research gaps grounded in the retrieved set.
+
+Integration rule:
+- Use the paper summaries as the primary evidence base.
+- Use the other agent outputs only as independent viewpoints to compare, reconcile, and triangulate.
+- Do not simply repeat another agent's wording; synthesize across perspectives.
 
 Return JSON only in this format:
 {{
@@ -434,6 +436,12 @@ Gap output:
 
 Task:
 Return a structured evidence verification layer.
+
+Arbitration rule:
+- Treat Researcher, Theorist, Methodologist, Critic, and Gap outputs as independent viewpoints.
+- Compare them against the paper summaries and metadata.
+- Reward points that converge across multiple viewpoints and the source evidence.
+- Downgrade points that depend on only one viewpoint or overreach the retrieved evidence.
 
 Return JSON only in this format:
 {{

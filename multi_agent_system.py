@@ -456,9 +456,8 @@ def cached_run_researcher(original_query: str, final_search_query: str, paper_te
 
 
 @st.cache_data(ttl=60 * 20, show_spinner=False)
-def cached_run_theorist(original_query: str, final_search_query: str, paper_text: str, researcher_json: str):
-    researcher_output = json.loads(researcher_json) if researcher_json else {}
-    return run_theorist(original_query, final_search_query, paper_text, researcher_output)
+def cached_run_theorist(original_query: str, final_search_query: str, paper_text: str):
+    return run_theorist(original_query, final_search_query, paper_text)
 
 
 @st.cache_data(ttl=60 * 20, show_spinner=False)
@@ -466,17 +465,11 @@ def cached_run_methodologist(
     original_query: str,
     final_search_query: str,
     paper_text: str,
-    researcher_json: str,
-    theorist_json: str
 ):
-    researcher_output = json.loads(researcher_json) if researcher_json else {}
-    theorist_output = json.loads(theorist_json) if theorist_json else {}
     return run_methodologist(
         original_query,
         final_search_query,
         paper_text,
-        researcher_output,
-        theorist_output
     )
 
 
@@ -485,20 +478,11 @@ def cached_run_critic(
     original_query: str,
     final_search_query: str,
     paper_text: str,
-    researcher_json: str,
-    theorist_json: str,
-    methodologist_json: str
 ):
-    researcher_output = json.loads(researcher_json) if researcher_json else {}
-    theorist_output = json.loads(theorist_json) if theorist_json else {}
-    methodologist_output = json.loads(methodologist_json) if methodologist_json else {}
     return run_critic(
         original_query,
         final_search_query,
         paper_text,
-        researcher_output,
-        theorist_output,
-        methodologist_output
     )
 
 
@@ -862,7 +846,6 @@ def theorist_agent(state: dict, progress_callback=None) -> dict:
         state["original_query"],
         state["final_search_query"],
         paper_text,
-        _safe_json_dumps(state.get("researcher", {}))
     )
     state["theorist"] = result
     add_trace(state, "TheoristAgent", "analyze", "conceptual framing and tensions", progress_callback=progress_callback)
@@ -876,8 +859,6 @@ def methodologist_agent(state: dict, progress_callback=None) -> dict:
         state["original_query"],
         state["final_search_query"],
         paper_text,
-        _safe_json_dumps(state.get("researcher", {})),
-        _safe_json_dumps(state.get("theorist", {}))
     )
     state["methodologist"] = result
     add_trace(state, "MethodologistAgent", "analyze", "study types, evidence profile, method gaps", progress_callback=progress_callback)
@@ -891,9 +872,6 @@ def critic_agent(state: dict, progress_callback=None) -> dict:
         state["original_query"],
         state["final_search_query"],
         paper_text,
-        _safe_json_dumps(state.get("researcher", {})),
-        _safe_json_dumps(state.get("theorist", {})),
-        _safe_json_dumps(state.get("methodologist", {}))
     )
     state["critic"] = result
     add_trace(state, "CriticAgent", "analyze", "weak zones, bias, off-target patterns", progress_callback=progress_callback)
@@ -946,7 +924,7 @@ def parallel_analysis_agent(state: dict, progress_callback=None) -> dict:
     # Otherwise users see an empty block when planner heuristics skip it.
     should_use_theorist = True
 
-    _emit(progress_callback, 90, "Parallel analysis wave 1/3: Researcher and Methodologist...")
+    _emit(progress_callback, 90, "Parallel analysis wave 1/3: independent Researcher and Methodologist reviews...")
 
     wave1_jobs = {
         "researcher": lambda: run_researcher(
@@ -958,8 +936,6 @@ def parallel_analysis_agent(state: dict, progress_callback=None) -> dict:
             state["original_query"],
             state["final_search_query"],
             paper_text,
-            {},
-            {},
         ),
     }
 
@@ -978,38 +954,31 @@ def parallel_analysis_agent(state: dict, progress_callback=None) -> dict:
 
     state["researcher"] = wave1_results.get("researcher", {})
     state["methodologist"] = wave1_results.get("methodologist", {})
-    add_trace(state, "ResearcherAgent", "parallel_complete", "wave1 parallel analysis complete", progress_callback=progress_callback)
-    add_trace(state, "MethodologistAgent", "parallel_complete", "wave1 parallel analysis complete", progress_callback=progress_callback)
+    add_trace(state, "ResearcherAgent", "parallel_complete", "wave1 independent review complete", progress_callback=progress_callback)
+    add_trace(state, "MethodologistAgent", "parallel_complete", "wave1 independent review complete", progress_callback=progress_callback)
 
     if should_use_theorist:
-        _emit(progress_callback, 92, "Parallel analysis wave 2/3: Theorist and Critic...")
+        _emit(progress_callback, 92, "Parallel analysis wave 2/3: independent Theorist and Critic reviews...")
 
         wave2_jobs = {
             "theorist": lambda: run_theorist(
                 state["original_query"],
                 state["final_search_query"],
                 paper_text,
-                state.get("researcher", {}),
             ),
             "critic": lambda: run_critic(
                 state["original_query"],
                 state["final_search_query"],
                 paper_text,
-                state.get("researcher", {}),
-                {},
-                state.get("methodologist", {}),
             ),
         }
     else:
-        _emit(progress_callback, 92, "Parallel analysis wave 2/3: Critic...")
+        _emit(progress_callback, 92, "Parallel analysis wave 2/3: independent Critic review...")
         wave2_jobs = {
             "critic": lambda: run_critic(
                 state["original_query"],
                 state["final_search_query"],
                 paper_text,
-                state.get("researcher", {}),
-                {},
-                state.get("methodologist", {}),
             ),
         }
 
@@ -1028,14 +997,14 @@ def parallel_analysis_agent(state: dict, progress_callback=None) -> dict:
 
     if should_use_theorist:
         state["theorist"] = wave2_results.get("theorist", {})
-        add_trace(state, "TheoristAgent", "parallel_complete", "wave2 parallel analysis complete", progress_callback=progress_callback)
+        add_trace(state, "TheoristAgent", "parallel_complete", "wave2 independent review complete", progress_callback=progress_callback)
     else:
         state["theorist"] = {}
 
     state["critic"] = wave2_results.get("critic", {})
-    add_trace(state, "CriticAgent", "parallel_complete", "wave2 parallel analysis complete", progress_callback=progress_callback)
+    add_trace(state, "CriticAgent", "parallel_complete", "wave2 independent review complete", progress_callback=progress_callback)
 
-    _emit(progress_callback, 95, "Parallel analysis wave 3/3: Gap Analyst and Verifier...")
+    _emit(progress_callback, 95, "Parallel analysis wave 3/3: Gap Analyst and Verifier integration...")
 
     wave3_jobs = {
         "gap_analyst": lambda: run_gap_analyst(
@@ -1074,11 +1043,11 @@ def parallel_analysis_agent(state: dict, progress_callback=None) -> dict:
 
     state["gap_analyst"] = wave3_results.get("gap_analyst", {})
     state["verifier"] = wave3_results.get("verifier", {})
-    add_trace(state, "GapAgent", "parallel_complete", "wave3 parallel analysis complete", progress_callback=progress_callback)
-    add_trace(state, "VerifierAgent", "parallel_complete", f"wave3 parallel analysis complete, confidence={state['verifier'].get('confidence_level', 'Medium')}", progress_callback=progress_callback)
+    add_trace(state, "GapAgent", "parallel_complete", "wave3 integration complete", progress_callback=progress_callback)
+    add_trace(state, "VerifierAgent", "parallel_complete", f"wave3 integration complete, confidence={state['verifier'].get('confidence_level', 'Medium')}", progress_callback=progress_callback)
 
     state["flags"]["analysis_bundle_done"] = True
-    add_trace(state, "ParallelAnalysisAgent", "complete", "post-retrieval analysis bundle finished", progress_callback=progress_callback)
+    add_trace(state, "ParallelAnalysisAgent", "complete", "post-retrieval independent reviews and integration finished", progress_callback=progress_callback)
     return state
 
 

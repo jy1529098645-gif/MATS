@@ -2,6 +2,7 @@ import datetime
 import copy
 import time
 from io import BytesIO
+from pathlib import Path
 
 import streamlit as st
 from reportlab.lib.pagesizes import A4
@@ -18,17 +19,17 @@ st.set_page_config(
     layout="wide"
 )
 
-# 建议在 st.set_page_config 之后
-try:
-    # 使用你图片所在的完整路径
-    # 注意：在 Windows 路径中使用正斜杠 / 或原始字符串 r"" 以避免转义错误
-    logo_path = r"H:/ATS_Dev/Picture/LOGO4.png" 
-    
-    # 居中展示 Logo，width 可根据实际效果调整
-    st.image(logo_path, width=200) 
-except Exception as e:
-    # 如果路径找不到或读取失败，不影响主程序运行
-    st.caption(f"Logo path not found: {logo_path}")
+BASE_DIR = Path(__file__).resolve().parent
+logo_path = BASE_DIR / "Picture" / "LOGO4.png"
+
+st.caption(f"BASE_DIR = {BASE_DIR}")
+st.caption(f"Trying logo path = {logo_path}")
+st.caption(f"Logo exists = {logo_path.exists()}")
+
+if logo_path.exists():
+    st.image(str(logo_path), width=200)
+else:
+    st.error(f"Logo path not found: {logo_path}")
 
 st.markdown(
     """
