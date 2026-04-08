@@ -238,6 +238,17 @@ def _split_brief_into_sections(brief_text: str):
 
     known_headings = {
         "Research Brief",
+        "# Research Brief",
+        "## Bottom Line",
+        "## What This Literature Actually Covers",
+        "## Strongest Signals",
+        "## Conceptual Framing",
+        "## Methodological Reading",
+        "## Where the Evidence Is Thin",
+        "## Research Gaps",
+        "## What This Means for Your Query",
+        "## Best Next Directions",
+        "## Confidence & Scope Note",
         "Bottom Line",
         "What This Literature Actually Covers",
         "Strongest Signals",
@@ -250,6 +261,9 @@ def _split_brief_into_sections(brief_text: str):
         "Confidence & Scope Note",
     }
 
+    def normalize_heading(line: str):
+        return line.lstrip("#").strip()
+
     for line in lines:
         if not line:
             if current_body and current_body[-1] != "":
@@ -257,17 +271,27 @@ def _split_brief_into_sections(brief_text: str):
             continue
 
         if line in known_headings:
-            if current_title or current_body:
+            normalized = normalize_heading(line)
+            if current_title is not None or current_body:
                 sections.append((current_title, "\n".join(current_body).strip()))
-            current_title = line
+            current_title = normalized
             current_body = []
         else:
             current_body.append(line)
 
-    if current_title or current_body:
+    if current_title is not None or current_body:
         sections.append((current_title, "\n".join(current_body).strip()))
 
-    return sections
+    # 去掉完全重复的 section
+    deduped = []
+    seen = set()
+    for title, body in sections:
+        key = (title or "", body or "")
+        if key not in seen:
+            seen.add(key)
+            deduped.append((title, body))
+
+    return deduped
 
 
 def build_research_brief_pdf_bytes(brief_text: str, original_query: str = "", final_search_query: str = "") -> bytes:
@@ -321,6 +345,22 @@ def build_research_brief_pdf_bytes(brief_text: str, original_query: str = "", fi
         textColor="#111827",
     )
 
+    # 清理重复标题，避免 PDF 中重复出现两份 Research Brief
+    clean_text = (brief_text or "").strip()
+
+    while "# Research Brief" in clean_text:
+        clean_text = clean_text.replace("# Research Brief", "Research Brief")
+
+    # 如果正文里重复出现多个 Research Brief，只保留第一份
+    marker = "Research Brief"
+    first_idx = clean_text.find(marker)
+    if first_idx != -1:
+        second_idx = clean_text.find(marker, first_idx + len(marker))
+        if second_idx != -1:
+            clean_text = clean_text[:second_idx].strip()
+
+    sections = _split_brief_into_sections(clean_text)
+
     story = []
     story.append(Paragraph("Research Brief", title_style))
 
@@ -330,27 +370,21 @@ def build_research_brief_pdf_bytes(brief_text: str, original_query: str = "", fi
         story.append(Paragraph(f"<b>Final search query:</b> {final_search_query}", meta_style))
     story.append(Spacer(1, 6))
 
-    sections = _split_brief_into_sections(brief_text)
     for idx, (section_title, section_body) in enumerate(sections):
-        if section_title == "Research Brief" and not section_body:
+        if section_title == "Research Brief":
             continue
 
-        if section_title and section_title != "Research Brief":
+        if section_title:
             story.append(Paragraph(section_title, heading_style))
 
-        paragraphs = [p.strip() for p in section_body.split("\n\n") if p.strip()] if section_body else []
-        for para in paragraphs:
-            para = para.replace("\n", "<br/>")
-            story.append(Paragraph(para, body_style))
-
-        if not section_title and section_body:
-            story.append(Paragraph(section_body.replace("\n", "<br/>"), body_style))
+        if section_body:
+            paragraphs = [p.strip() for p in section_body.split("\n\n") if p.strip()]
+            for para in paragraphs:
+                para = para.replace("\n", "<br/>")
+                story.append(Paragraph(para, body_style))
 
         if idx < len(sections) - 1:
             story.append(Spacer(1, 3))
-
-    if not sections and brief_text.strip():
-        story.append(Paragraph(brief_text.replace("\n", "<br/>"), body_style))
 
     doc.build(story)
     return buffer.getvalue()
@@ -400,6 +434,24 @@ def truncate_text(text: str, limit: int = 220) -> str:
     if len(text) <= limit:
         return text
     return text[:limit].rstrip() + "..."
+
+def make_safe_pdf_filename(original_query: str) -> str:
+    query = (original_query or "research_brief").strip().lower()
+
+    # 把空格变成下划线
+    query = query.replace(" ", "_")
+
+    # 去掉不适合做文件名的字符
+    query = "".join(ch for ch in query if ch.isalnum() or ch in ["_", "-"])
+
+    # 避免文件名太长
+    query = query[:50].strip("_")
+
+    if not query:
+        query = "research_brief"
+
+    today = datetime.datetime.now().strftime("%Y-%m-%d")
+    return f"research_brief_{query}_{today}.pdf"
 
 
 def render_evidence_chip(strength: str, score: int):
@@ -642,10 +694,15 @@ def render_final_brief(result: dict):
                     original_query=result.get("original_query", ""),
                     final_search_query=result.get("final_search_query", ""),
                 )
+
+                pdf_filename = make_safe_pdf_filename(
+                    result.get("original_query", "")
+                )
+
                 st.download_button(
                     label="Download Research Brief as PDF",
                     data=pdf_bytes,
-                    file_name="research_brief.pdf",
+                    file_name=pdf_filename,
                     mime="application/pdf",
                     use_container_width=False,
                     key="download_research_brief_pdf",
@@ -662,7 +719,6 @@ def render_final_brief(result: dict):
                 st.info("No final brief available.")
 
     st.markdown("</div>", unsafe_allow_html=True)
-
 
 def render_structured_agent(name: str, payload: dict):
     st.write(f"**{name} summary**")
