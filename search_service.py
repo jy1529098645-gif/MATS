@@ -1,8 +1,10 @@
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from urllib.parse import quote
+from xml.etree import ElementTree as ET
 
 import requests
 import streamlit as st
@@ -24,13 +26,26 @@ SOURCE_LABELS = {
     "OpenAlex": "OpenAlex",
     "Crossref": "Crossref",
     "Google Scholar": "Google Scholar",
+    "arXiv": "arXiv",
+    "PubMed": "PubMed",
+    "ERIC": "ERIC",
+    "DOAJ": "DOAJ",
+    "DiGRA": "DiGRA",
 }
+
+SCREENING_MAX_WORKERS = 4
+ADVERSARIAL_FIT_MIN = 40.0
+ADVERSARIAL_FIT_MAX = 80.0
 
 
 def emit_progress(progress_callback, value, message, payload=None):
+    merged_payload = {"type": "progress"}
+    if isinstance(payload, dict):
+        merged_payload.update(payload)
+
     if progress_callback:
         try:
-            progress_callback(value, message, payload)
+            progress_callback(value, message, merged_payload)
         except TypeError:
             progress_callback(value, message)
 
@@ -832,6 +847,290 @@ def search_google_scholar_serpapi(query: str, limit: int = 20):
     return papers[:limit]
 
 
+
+
+def _safe_get_nested(value, path, default=""):
+    current = value
+    for key in path:
+        if isinstance(current, dict):
+            current = current.get(key)
+        else:
+            return default
+    return current if current not in [None, ""] else default
+
+
+def _extract_year_from_text(text: str):
+    if not text:
+        return None
+    m = re.search(r"(19|20)\d{2}", str(text))
+    return int(m.group(0)) if m else None
+
+
+def _xml_text(node, xpath: str) -> str:
+    found = node.find(xpath)
+    if found is None or found.text is None:
+        return ""
+    return found.text.strip()
+
+
+@st.cache_data(ttl=60 * 60, show_spinner=False)
+def search_arxiv(query: str, limit: int = 20):
+    url = "https://export.arxiv.org/api/query"
+    params = {
+        "search_query": f"all:{query}",
+        "start": 0,
+        "max_results": min(max(1, limit), 100),
+        "sortBy": "relevance",
+        "sortOrder": "descending",
+    }
+    response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT, headers=make_headers())
+    if response.status_code != 200:
+        return []
+
+    ns = {"atom": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
+    root = ET.fromstring(response.text)
+    papers = []
+    for entry in root.findall("atom:entry", ns):
+        title = _xml_text(entry, "atom:title") or "No title"
+        summary = _xml_text(entry, "atom:summary") or "No abstract available."
+        published = _xml_text(entry, "atom:published")
+        year = _extract_year_from_text(published) or "Unknown year"
+        authors = ", ".join(
+            [a.findtext("atom:name", default="", namespaces=ns).strip() for a in entry.findall("atom:author", ns) if a.findtext("atom:name", default="", namespaces=ns).strip()]
+        ) or "Unknown authors"
+        url_value = _xml_text(entry, "atom:id")
+        pdf_url = ""
+        doi = ""
+        for link in entry.findall("atom:link", ns):
+            if link.attrib.get("title") == "pdf" or link.attrib.get("type") == "application/pdf":
+                pdf_url = link.attrib.get("href", "")
+                break
+        doi = _xml_text(entry, "arxiv:doi")
+        papers.append({
+            "title": title.replace("\n", " ").strip(),
+            "summary": summary.replace("\n", " ").strip(),
+            "year": year,
+            "authors": authors,
+            "url": url_value,
+            "source": "arXiv",
+            "doi": clean_doi(doi),
+            "pdf_url": pdf_url,
+            "oa_url": pdf_url or url_value,
+            "is_oa": True,
+        })
+    return papers[:limit]
+
+
+@st.cache_data(ttl=60 * 60, show_spinner=False)
+def search_pubmed(query: str, limit: int = 20):
+    esearch_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+    esearch_params = {
+        "db": "pubmed",
+        "term": query,
+        "retmode": "json",
+        "retmax": min(max(1, limit), 100),
+        "sort": "relevance",
+    }
+    search_resp = requests.get(esearch_url, params=esearch_params, timeout=REQUEST_TIMEOUT, headers=make_headers())
+    if search_resp.status_code != 200:
+        return []
+    id_list = (((search_resp.json() or {}).get("esearchresult") or {}).get("idlist") or [])
+    if not id_list:
+        return []
+
+    esummary_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
+    esummary_resp = requests.get(esummary_url, params={"db": "pubmed", "id": ",".join(id_list), "retmode": "json"}, timeout=REQUEST_TIMEOUT, headers=make_headers())
+    if esummary_resp.status_code != 200:
+        return []
+    summary_json = esummary_resp.json() or {}
+    result = summary_json.get("result") or {}
+
+    papers = []
+    for pmid in id_list:
+        item = result.get(pmid) or {}
+        title = str(item.get("title") or "No title").strip()
+        authors = ", ".join([a.get("name", "").strip() for a in (item.get("authors") or [])[:5] if a.get("name")]) or "Unknown authors"
+        pubdate = str(item.get("pubdate") or "")
+        year = _extract_year_from_text(pubdate) or "Unknown year"
+        article_ids = item.get("articleids") or []
+        doi = ""
+        pmcid = ""
+        for aid in article_ids:
+            idtype = str(aid.get("idtype") or "").lower()
+            if idtype == "doi" and not doi:
+                doi = aid.get("value", "")
+            elif idtype == "pmc" and not pmcid:
+                pmcid = aid.get("value", "")
+        url_value = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+        oa_url = f"https://pmc.ncbi.nlm.nih.gov/articles/{pmcid}/pdf/" if pmcid else ""
+        papers.append({
+            "title": title,
+            "summary": "No abstract available.",
+            "year": year,
+            "authors": authors,
+            "url": url_value,
+            "source": "PubMed",
+            "doi": clean_doi(doi),
+            "pdf_url": oa_url,
+            "oa_url": oa_url,
+            "is_oa": bool(pmcid),
+        })
+
+    # fetch abstracts in batches from efetch xml
+    efetch_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+    efetch_resp = requests.get(efetch_url, params={"db": "pubmed", "id": ",".join(id_list), "retmode": "xml", "rettype": "abstract"}, timeout=REQUEST_TIMEOUT, headers=make_headers())
+    if efetch_resp.status_code == 200:
+        try:
+            root = ET.fromstring(efetch_resp.text)
+            articles = root.findall(".//PubmedArticle")
+            for idx, article in enumerate(articles[:len(papers)]):
+                abstract_texts = [" ".join(t.itertext()).strip() for t in article.findall('.//Abstract/AbstractText') if " ".join(t.itertext()).strip()]
+                if abstract_texts:
+                    papers[idx]["summary"] = " ".join(abstract_texts)
+        except Exception:
+            pass
+
+    return papers[:limit]
+
+
+@st.cache_data(ttl=60 * 60, show_spinner=False)
+def search_eric(query: str, limit: int = 20):
+    url = "https://api.ies.ed.gov/eric/"
+    params = {
+        "search": query,
+        "format": "json",
+        "start": 0,
+        "rows": min(max(1, limit), 200),
+    }
+    response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT, headers=make_headers())
+    if response.status_code != 200:
+        return []
+    data = response.json() or {}
+    records = data.get("response", {}).get("docs") or data.get("docs") or []
+    papers = []
+    for item in records[:limit]:
+        title = _safe_get_nested(item, ["title"], "No title")
+        summary = _safe_get_nested(item, ["abstract"], "No abstract available.")
+        year = normalize_year(item.get("publicationyear") or item.get("year")) or "Unknown year"
+        authors_value = item.get("author") or item.get("authors") or []
+        if isinstance(authors_value, list):
+            authors = ", ".join([str(x).strip() for x in authors_value[:5] if str(x).strip()]) or "Unknown authors"
+        else:
+            authors = str(authors_value).strip() or "Unknown authors"
+        eric_id = item.get("id") or item.get("ericNumber") or item.get("accessionnumber") or ""
+        pdf_url = item.get("pdfurl") or item.get("fulltexturl") or ""
+        url_value = item.get("url") or (f"https://eric.ed.gov/?id={eric_id}" if eric_id else "")
+        papers.append({
+            "title": title,
+            "summary": summary,
+            "year": year,
+            "authors": authors,
+            "url": url_value,
+            "source": "ERIC",
+            "doi": clean_doi(item.get("doi") or ""),
+            "pdf_url": pdf_url,
+            "oa_url": pdf_url or url_value,
+            "is_oa": bool(pdf_url),
+        })
+    return papers[:limit]
+
+
+@st.cache_data(ttl=60 * 60, show_spinner=False)
+def search_doaj(query: str, limit: int = 20):
+    # public DOAJ search endpoint
+    url = f"https://doaj.org/api/search/articles/{quote(query)}"
+    params = {"page": 1, "pageSize": min(max(1, limit), 100)}
+    response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT, headers=make_headers())
+    if response.status_code != 200:
+        return []
+    data = response.json() or {}
+    results = data.get("results") or []
+    papers = []
+    for item in results[:limit]:
+        bibjson = item.get("bibjson") or {}
+        title = bibjson.get("title") or "No title"
+        summary = bibjson.get("abstract") or "No abstract available."
+        year = normalize_year(_safe_get_nested(bibjson, ["year"])) or "Unknown year"
+        authors = ", ".join([a.get("name", "").strip() for a in (bibjson.get("author") or [])[:5] if a.get("name")]) or "Unknown authors"
+        links = bibjson.get("link") or []
+        pdf_url = ""
+        url_value = item.get("id") or ""
+        for link in links:
+            ltype = str(link.get("type") or "").lower()
+            if not url_value and link.get("url"):
+                url_value = link.get("url")
+            if "fulltext" in ltype or str(link.get("content_type") or "").lower() == "application/pdf":
+                pdf_url = link.get("url", "")
+                break
+        identifier = bibjson.get("identifier") or []
+        doi = ""
+        for ident in identifier:
+            if str(ident.get("type") or "").lower() == "doi":
+                doi = ident.get("id", "")
+                break
+        papers.append({
+            "title": title,
+            "summary": summary,
+            "year": year,
+            "authors": authors,
+            "url": url_value,
+            "source": "DOAJ",
+            "doi": clean_doi(doi),
+            "pdf_url": pdf_url,
+            "oa_url": pdf_url or url_value,
+            "is_oa": True,
+        })
+    return papers[:limit]
+
+
+@st.cache_data(ttl=60 * 60, show_spinner=False)
+def search_digra(query: str, limit: int = 20):
+    # OJS-based search page; falls back gracefully if the site structure changes
+    url = "https://dl.digra.org/index.php/dl/search/search"
+    params = {"query": query}
+    response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT, headers=make_headers())
+    if response.status_code != 200:
+        return []
+    html_text = response.text
+    blocks = re.split(r'<article[^>]*class="[^"]*obj_article_summary[^"]*"[^>]*>', html_text, flags=re.I)
+    papers = []
+    for block in blocks[1:limit+1]:
+        title_match = re.search(r'<a[^>]+href="([^"]+)"[^>]*class="title"[^>]*>(.*?)</a>', block, flags=re.I | re.S)
+        if not title_match:
+            title_match = re.search(r'<h3[^>]*>.*?<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', block, flags=re.I | re.S)
+        if not title_match:
+            continue
+        url_value = re.sub(r'&amp;', '&', title_match.group(1))
+        title = re.sub(r'<[^>]+>', ' ', title_match.group(2))
+        title = re.sub(r'\s+', ' ', title).strip() or 'No title'
+        authors_match = re.search(r'<div[^>]*class="[^"]*authors[^"]*"[^>]*>(.*?)</div>', block, flags=re.I | re.S)
+        authors = re.sub(r'<[^>]+>', ' ', authors_match.group(1)) if authors_match else 'Unknown authors'
+        authors = re.sub(r'\s+', ' ', authors).strip() or 'Unknown authors'
+        summary_match = re.search(r'<div[^>]*class="[^"]*description[^"]*"[^>]*>(.*?)</div>', block, flags=re.I | re.S)
+        summary = re.sub(r'<[^>]+>', ' ', summary_match.group(1)) if summary_match else 'No abstract available.'
+        summary = re.sub(r'\s+', ' ', summary).strip() or 'No abstract available.'
+        year_match = re.search(r'(19|20)\d{2}', block)
+        year = int(year_match.group(0)) if year_match else 'Unknown year'
+        pdf_match = re.search(r'href="([^"]+?/download/[^"]+\.pdf[^"]*)"', block, flags=re.I)
+        pdf_url = re.sub(r'&amp;', '&', pdf_match.group(1)) if pdf_match else ''
+        if url_value.startswith('/'):
+            url_value = 'https://dl.digra.org' + url_value
+        if pdf_url.startswith('/'):
+            pdf_url = 'https://dl.digra.org' + pdf_url
+        papers.append({
+            'title': title,
+            'summary': summary,
+            'year': year,
+            'authors': authors,
+            'url': url_value,
+            'source': 'DiGRA',
+            'doi': '',
+            'pdf_url': pdf_url,
+            'oa_url': pdf_url or url_value,
+            'is_oa': True,
+        })
+    return papers[:limit]
+
 @st.cache_data(ttl=60 * 30, show_spinner=False)
 def enrich_unpaywall_by_doi(doi: str):
     doi = clean_doi(doi)
@@ -904,6 +1203,38 @@ def retrieve_candidate_papers(query: str, candidate_limit: int = 200, source_fil
     if "Google Scholar" in source_filters:
         try:
             all_papers.extend(search_google_scholar_serpapi(query, min(source_limit, 20)))
+        except Exception:
+            pass
+
+    if "arXiv" in source_filters:
+        try:
+            all_papers.extend(search_arxiv(query, source_limit))
+        except Exception:
+            pass
+
+    if "PubMed" in source_filters:
+        try:
+            all_papers.extend(search_pubmed(query, source_limit))
+        except Exception:
+            pass
+
+    if "ERIC" in source_filters:
+        try:
+            all_papers.extend(search_eric(query, source_limit))
+        except Exception:
+            pass
+
+    if "DOAJ" in source_filters:
+        try:
+            all_papers.extend(search_doaj(query, source_limit))
+        except Exception:
+            pass
+
+
+
+    if "DiGRA" in source_filters:
+        try:
+            all_papers.extend(search_digra(query, min(source_limit, 50)))
         except Exception:
             pass
 
@@ -1289,6 +1620,136 @@ def run_adversarial_batch(
         return []
 
 
+def _safe_float(value, fallback=0.0):
+    try:
+        return float(value)
+    except Exception:
+        return fallback
+
+
+
+def _default_second_stage_meta(paper: dict) -> dict:
+    return {
+        "research_fit_score": 55,
+        "domain_fit_label": "adjacent",
+        "paper_type_label": "theory/other",
+        "abstract_quality_label": "good" if has_good_abstract(paper.get("summary", "")) else "missing",
+        "off_target_risk_score": 45 if has_good_abstract(paper.get("summary", "")) else 68,
+        "reason": "Reasonable keyword match, but not strongly confirmed by second-stage screening.",
+    }
+
+
+
+def _default_adversarial_result() -> dict:
+    return {
+        "selector_decision": "keep",
+        "selector_reason": "Initial selector pass found enough topical support.",
+        "critic_decision": "uncertain",
+        "critic_reason": "No decisive rejection signal was found in the adversarial pass.",
+        "arbiter_decision": "uncertain",
+        "arbiter_reason": "Borderline paper kept in reserve because the debate was inconclusive.",
+        "debate_severity": "medium",
+        "confidence": 0.58,
+    }
+
+
+
+def _build_bypass_adversarial_result(research_fit_score: float) -> dict:
+    if research_fit_score > ADVERSARIAL_FIT_MAX:
+        return {
+            "selector_decision": "keep",
+            "selector_reason": "The second-stage screen rated this paper clearly above the adversarial review band.",
+            "critic_decision": "uncertain",
+            "critic_reason": "No adversarial review was triggered because the fit score was already clearly strong.",
+            "arbiter_decision": "keep",
+            "arbiter_reason": "Skipped adversarial review because the paper was already a strong-fit candidate.",
+            "debate_severity": "low",
+            "confidence": 0.92,
+        }
+
+    return {
+        "selector_decision": "reject",
+        "selector_reason": "The second-stage screen rated this paper clearly below the adversarial review band.",
+        "critic_decision": "reject",
+        "critic_reason": "No adversarial review was triggered because the fit score was already clearly weak.",
+        "arbiter_decision": "reject",
+        "arbiter_reason": "Skipped adversarial review because the paper was already a weak-fit candidate.",
+        "debate_severity": "low",
+        "confidence": 0.9,
+    }
+
+
+
+def _build_second_stage_compact_batch(batch: list) -> list:
+    compact_batch = []
+    for p in batch:
+        compact_batch.append({
+            "title": p.get("title", ""),
+            "authors": p.get("authors", ""),
+            "year": p.get("year", ""),
+            "source": p.get("source", ""),
+            "summary": p.get("summary", ""),
+            "is_oa": p.get("is_oa", False),
+        })
+    return compact_batch
+
+
+
+def _build_adversarial_compact_batch(batch: list) -> list:
+    compact_batch = []
+    for p in batch:
+        compact_batch.append({
+            "title": p.get("title", ""),
+            "authors": p.get("authors", ""),
+            "year": p.get("year", ""),
+            "source": p.get("source", ""),
+            "summary": p.get("summary", ""),
+            "is_oa": p.get("is_oa", False),
+            "_llm_meta": p.get("_llm_meta", {}),
+        })
+    return compact_batch
+
+
+
+def _run_second_stage_parallel_batch(
+    batch_idx: int,
+    start: int,
+    batch: list,
+    *,
+    original_query: str,
+    retrieval_query: str,
+    sort_mode: str,
+    intent_profile: dict,
+):
+    llm_scores = llm_rerank_batch(
+        original_query=original_query,
+        retrieval_query=retrieval_query,
+        sort_mode=sort_mode,
+        intent_profile_json=json.dumps(intent_profile, sort_keys=True, ensure_ascii=False),
+        batch_json=json.dumps(_build_second_stage_compact_batch(batch), sort_keys=True, ensure_ascii=False),
+    )
+    return batch_idx, start, batch, llm_scores
+
+
+
+def _run_adversarial_parallel_batch(
+    batch_idx: int,
+    batch_items: list,
+    *,
+    original_query: str,
+    retrieval_query: str,
+    intent_profile: dict,
+):
+    batch = [item[1] for item in batch_items]
+    batch_results = run_adversarial_batch(
+        original_query=original_query,
+        retrieval_query=retrieval_query,
+        intent_profile_json=json.dumps(intent_profile, sort_keys=True, ensure_ascii=False),
+        batch_json=json.dumps(_build_adversarial_compact_batch(batch), sort_keys=True, ensure_ascii=False),
+    )
+    return batch_idx, batch_items, batch_results
+
+
 def run_adversarial_screening(
     original_query: str,
     retrieval_query: str,
@@ -1303,87 +1764,108 @@ def run_adversarial_screening(
 
     intent_profile = normalize_intent_profile(intent_profile)
     batch_size = 5
-    total_batches = max(1, (len(candidates) + batch_size - 1) // batch_size)
-    debate_trace = []
-    enriched = []
+    debate_trace_by_index = {}
+    enriched_by_index = {}
+    review_targets = []
 
-    for batch_idx, start in enumerate(range(0, len(candidates), batch_size), start=1):
-        batch = candidates[start:start + batch_size]
-        progress_value = progress_start + ((batch_idx - 1) / total_batches) * (progress_end - progress_start)
+    for idx, p in enumerate(candidates):
+        research_fit_score = _safe_float((p.get("_llm_meta") or {}).get("research_fit_score"), 55.0)
+        p_copy = dict(p)
+
+        if ADVERSARIAL_FIT_MIN <= research_fit_score <= ADVERSARIAL_FIT_MAX:
+            review_targets.append((idx, p_copy))
+        else:
+            p_copy["adversarial_screening"] = _build_bypass_adversarial_result(research_fit_score)
+            enriched_by_index[idx] = p_copy
+
+    skipped_count = len(candidates) - len(review_targets)
+    if review_targets:
         emit_progress(
             progress_callback,
-            progress_value,
-            f"Adversarial screening batch {batch_idx}/{total_batches}..."
+            progress_start,
+            f"Adversarial screening on borderline-fit papers only: {len(review_targets)} selected, {skipped_count} skipped..."
         )
-
-        compact_batch = []
-        for p in batch:
-            compact_batch.append({
-                "title": p.get("title", ""),
-                "authors": p.get("authors", ""),
-                "year": p.get("year", ""),
-                "source": p.get("source", ""),
-                "summary": p.get("summary", ""),
-                "is_oa": p.get("is_oa", False),
-                "_llm_meta": p.get("_llm_meta", {}),
-            })
-
-        batch_results = run_adversarial_batch(
-            original_query=original_query,
-            retrieval_query=retrieval_query,
-            intent_profile_json=json.dumps(intent_profile, sort_keys=True, ensure_ascii=False),
-            batch_json=json.dumps(compact_batch, sort_keys=True, ensure_ascii=False),
+    else:
+        emit_progress(
+            progress_callback,
+            progress_end,
+            f"Adversarial screening skipped: all {len(candidates)} papers fell outside the {int(ADVERSARIAL_FIT_MIN)}–{int(ADVERSARIAL_FIT_MAX)} fit band."
         )
+        enriched = [enriched_by_index[i] for i in range(len(candidates))]
+        return enriched, []
 
-        mapped = {}
-        for item in batch_results:
-            paper_index = item.get("paper_index")
-            if isinstance(paper_index, int) and 1 <= paper_index <= len(batch):
-                mapped[paper_index - 1] = item
+    total_batches = max(1, (len(review_targets) + batch_size - 1) // batch_size)
+    batch_items_list = [
+        review_targets[start:start + batch_size]
+        for start in range(0, len(review_targets), batch_size)
+    ]
+    max_workers = min(SCREENING_MAX_WORKERS, total_batches)
+    completed_batches = 0
 
-        batch_live_entries = []
-        for local_idx, p in enumerate(batch):
-            adv = mapped.get(local_idx)
-            if adv is None:
-                adv = {
-                    "selector_decision": "keep",
-                    "selector_reason": "Initial selector pass found enough topical support.",
-                    "critic_decision": "uncertain",
-                    "critic_reason": "No decisive rejection signal was found in the adversarial pass.",
-                    "arbiter_decision": "uncertain",
-                    "arbiter_reason": "Borderline paper kept in reserve because the debate was inconclusive.",
-                    "debate_severity": "medium",
-                    "confidence": 0.58,
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {
+            executor.submit(
+                _run_adversarial_parallel_batch,
+                batch_idx,
+                batch_items,
+                original_query=original_query,
+                retrieval_query=retrieval_query,
+                intent_profile=intent_profile,
+            ): batch_idx
+            for batch_idx, batch_items in enumerate(batch_items_list, start=1)
+        }
+
+        for future in as_completed(future_map):
+            batch_idx = future_map[future]
+            try:
+                _, batch_items, batch_results = future.result()
+            except Exception:
+                batch_items = batch_items_list[batch_idx - 1]
+                batch_results = []
+
+            batch = [item[1] for item in batch_items]
+            mapped = {}
+            for item in batch_results:
+                paper_index = item.get("paper_index")
+                if isinstance(paper_index, int) and 1 <= paper_index <= len(batch):
+                    mapped[paper_index - 1] = item
+
+            batch_live_entries = []
+            for local_idx, (global_idx, p) in enumerate(batch_items):
+                adv = mapped.get(local_idx) or _default_adversarial_result()
+
+                p_copy = dict(p)
+                p_copy["adversarial_screening"] = adv
+                enriched_by_index[global_idx] = p_copy
+
+                entry = {
+                    "title": p.get("title", "Untitled"),
+                    "selector_decision": adv.get("selector_decision", "uncertain"),
+                    "selector_reason": adv.get("selector_reason", ""),
+                    "critic_decision": adv.get("critic_decision", "uncertain"),
+                    "critic_reason": adv.get("critic_reason", ""),
+                    "arbiter_decision": adv.get("arbiter_decision", "uncertain"),
+                    "arbiter_reason": adv.get("arbiter_reason", ""),
+                    "debate_severity": adv.get("debate_severity", "medium"),
+                    "confidence": adv.get("confidence", 0.0),
                 }
+                debate_trace_by_index[global_idx] = entry
+                batch_live_entries.append(entry)
 
-            p_copy = dict(p)
-            p_copy["adversarial_screening"] = adv
-            enriched.append(p_copy)
+            completed_batches += 1
+            progress_value = progress_start + (completed_batches / total_batches) * (progress_end - progress_start)
+            emit_progress(
+                progress_callback,
+                min(progress_end, progress_value),
+                f"Adversarial screening batch {completed_batches}/{total_batches} completed in parallel...",
+                payload={
+                    "event_type": "adversarial_trace",
+                    "entries": batch_live_entries,
+                }
+            )
 
-            entry = {
-                "title": p.get("title", "Untitled"),
-                "selector_decision": adv.get("selector_decision", "uncertain"),
-                "selector_reason": adv.get("selector_reason", ""),
-                "critic_decision": adv.get("critic_decision", "uncertain"),
-                "critic_reason": adv.get("critic_reason", ""),
-                "arbiter_decision": adv.get("arbiter_decision", "uncertain"),
-                "arbiter_reason": adv.get("arbiter_reason", ""),
-                "debate_severity": adv.get("debate_severity", "medium"),
-                "confidence": adv.get("confidence", 0.0),
-            }
-            debate_trace.append(entry)
-            batch_live_entries.append(entry)
-
-        emit_progress(
-            progress_callback,
-            min(progress_end, progress_value + 1),
-            f"Adversarial screening batch {batch_idx}/{total_batches} resolved.",
-            payload={
-                "event_type": "adversarial_trace",
-                "entries": batch_live_entries,
-            }
-        )
-
+    enriched = [enriched_by_index[i] for i in range(len(candidates))]
+    debate_trace = [debate_trace_by_index[i] for i in sorted(debate_trace_by_index)]
     emit_progress(progress_callback, progress_end, "Adversarial screening complete.")
     return enriched, debate_trace
 
@@ -1405,41 +1887,55 @@ def enrich_candidates_with_llm_scores(
     batch_size = 6
     scored_map = {}
     total_batches = max(1, (len(candidates) + batch_size - 1) // batch_size)
+    max_workers = min(SCREENING_MAX_WORKERS, total_batches)
+    completed_batches = 0
 
-    for batch_idx, start in enumerate(range(0, len(candidates), batch_size), start=1):
-        batch = candidates[start:start + batch_size]
+    batch_specs = [
+        (batch_idx, start, candidates[start:start + batch_size])
+        for batch_idx, start in enumerate(range(0, len(candidates), batch_size), start=1)
+    ]
 
-        progress_value = progress_start + ((batch_idx - 1) / total_batches) * (progress_end - progress_start)
-        emit_progress(
-            progress_callback,
-            progress_value,
-            f"Second-stage AI screening batch {batch_idx}/{total_batches}..."
-        )
+    emit_progress(
+        progress_callback,
+        progress_start,
+        f"Launching parallel second-stage AI screening across {total_batches} batches..."
+    )
 
-        compact_batch = []
-        for p in batch:
-            compact_batch.append({
-                "title": p.get("title", ""),
-                "authors": p.get("authors", ""),
-                "year": p.get("year", ""),
-                "source": p.get("source", ""),
-                "summary": p.get("summary", ""),
-                "is_oa": p.get("is_oa", False),
-            })
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {
+            executor.submit(
+                _run_second_stage_parallel_batch,
+                batch_idx,
+                start,
+                batch,
+                original_query=original_query,
+                retrieval_query=retrieval_query,
+                sort_mode=sort_mode,
+                intent_profile=intent_profile,
+            ): (batch_idx, start, batch)
+            for batch_idx, start, batch in batch_specs
+        }
 
-        llm_scores = llm_rerank_batch(
-            original_query=original_query,
-            retrieval_query=retrieval_query,
-            sort_mode=sort_mode,
-            intent_profile_json=json.dumps(intent_profile, sort_keys=True, ensure_ascii=False),
-            batch_json=json.dumps(compact_batch, sort_keys=True, ensure_ascii=False),
-        )
+        for future in as_completed(future_map):
+            batch_idx, start, batch = future_map[future]
+            try:
+                _, start, batch, llm_scores = future.result()
+            except Exception:
+                llm_scores = []
 
-        for item in llm_scores:
-            paper_index = item.get("paper_index")
-            if isinstance(paper_index, int) and 1 <= paper_index <= len(batch):
-                global_index = start + paper_index - 1
-                scored_map[global_index] = item
+            for item in llm_scores:
+                paper_index = item.get("paper_index")
+                if isinstance(paper_index, int) and 1 <= paper_index <= len(batch):
+                    global_index = start + paper_index - 1
+                    scored_map[global_index] = item
+
+            completed_batches += 1
+            progress_value = progress_start + (completed_batches / total_batches) * (progress_end - progress_start)
+            emit_progress(
+                progress_callback,
+                min(progress_end, progress_value),
+                f"Second-stage AI screening batch {completed_batches}/{total_batches} completed in parallel..."
+            )
 
     emit_progress(progress_callback, progress_end, "Second-stage AI screening complete.")
 
@@ -1449,14 +1945,7 @@ def enrich_candidates_with_llm_scores(
         llm_meta = scored_map.get(i)
 
         if llm_meta is None:
-            llm_meta = {
-                "research_fit_score": 55,
-                "domain_fit_label": "adjacent",
-                "paper_type_label": "theory/other",
-                "abstract_quality_label": "good" if has_good_abstract(p_copy.get("summary", "")) else "missing",
-                "off_target_risk_score": 45 if has_good_abstract(p_copy.get("summary", "")) else 68,
-                "reason": "Reasonable keyword match, but not strongly confirmed by second-stage screening."
-            }
+            llm_meta = _default_second_stage_meta(p_copy)
 
         p_copy["_llm_meta"] = llm_meta
         enriched.append(p_copy)
@@ -1465,6 +1954,7 @@ def enrich_candidates_with_llm_scores(
 
 
 def combine_rule_and_llm_scores(
+
     paper: dict,
     sort_mode: str = "Balanced",
     prefer_abstracts: bool = True,
@@ -2032,6 +2522,7 @@ def search_papers_with_diagnostics_live(
         progress_end=72,
     )
 
+    emit_progress(progress_callback, 71, "Selecting borderline-fit papers for parallel adversarial screening...")
     llm_enriched, adversarial_trace = run_adversarial_screening(
         original_query=original_query or query,
         retrieval_query=query,

@@ -8,14 +8,14 @@ load_dotenv()
 openai_api_key = os.getenv("OPENAI_API_KEY")
 anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
 
-if not openai_api_key:
-    raise ValueError("OPENAI_API_KEY not found. Please check your .env file.")
-
-openai_client = OpenAI(api_key=openai_api_key)
+openai_client = OpenAI(api_key=openai_api_key) if openai_api_key else None
 anthropic_client = Anthropic(api_key=anthropic_api_key) if anthropic_api_key else None
 
 
 def ask_openai(prompt: str, model: str = "gpt-5.4-mini") -> str:
+    if not openai_client:
+        raise ValueError("OPENAI_API_KEY not found. Please check your .env file.")
+
     response = openai_client.responses.create(
         model=model,
         input=prompt

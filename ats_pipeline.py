@@ -81,8 +81,18 @@ def _emit(progress_callback, value, message, payload=None):
         except TypeError:
             progress_callback(value, message)
 
+def _emit_progress(progress_callback, value, message, payload=None):
+    merged_payload = {"type": "progress"}
+    if isinstance(payload, dict):
+        merged_payload.update(payload)
 
-@st.cache_data(ttl=60 * 20, show_spinner=False)
+    if progress_callback:
+        try:
+            progress_callback(value, message, merged_payload)
+        except TypeError:
+            progress_callback(value, message)
+
+
 def cached_run_multi_agent(
     original_query: str,
     final_search_query: str,
@@ -141,7 +151,7 @@ def run_ats(
     }
 
     if progress_callback:
-        _emit(progress_callback, 4, "Initializing multi-agent collaboration...")
+        _emit_progress(progress_callback, 4, "Initializing multi-agent collaboration...")
         state = run_multi_agent_collaboration(
             original_query=original_query,
             final_search_query=final_search_query,
@@ -187,7 +197,7 @@ def run_ats(
     )
 
     if not papers:
-        _emit(progress_callback, 100, "No papers found.")
+        _emit_progress(progress_callback, 100, "No papers found.")
         return {
             "original_query": original_query,
             "final_search_query": final_search_query,
@@ -201,6 +211,7 @@ def run_ats(
             "gap_analyst": {},
             "verifier": {},
             "editor": "",
+            "editor_error": state.get("editor_error", ""),
             "intent_applied": selected_option.get("label", ""),
             "settings": settings,
             "strategy_summary": strategy_summary,
@@ -210,7 +221,7 @@ def run_ats(
             "collaboration_metrics": collaboration_metrics,
         }
 
-    _emit(progress_callback, 100, "ATS pipeline complete.")
+    _emit_progress(progress_callback, 100, "ATS pipeline complete.")
 
     return {
         "original_query": original_query,
@@ -225,6 +236,7 @@ def run_ats(
         "gap_analyst": state.get("gap_analyst", {}),
         "verifier": state.get("verifier", {}),
         "editor": state.get("editor", ""),
+        "editor_error": state.get("editor_error", ""),
         "intent_applied": selected_option.get("label", ""),
         "settings": settings,
         "strategy_summary": strategy_summary,

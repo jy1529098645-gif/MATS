@@ -31,6 +31,18 @@ def _emit(progress_callback, value, message, payload=None):
             progress_callback(value, message)
 
 
+def _emit_progress(progress_callback, value, message, payload=None):
+    merged_payload = {"type": "progress"}
+    if isinstance(payload, dict):
+        merged_payload.update(payload)
+
+    if progress_callback:
+        try:
+            progress_callback(value, message, merged_payload)
+        except TypeError:
+            progress_callback(value, message)
+
+
 def _truncate_text(text: str, max_chars: int = 1000) -> str:
     if not text:
         return ""
@@ -183,10 +195,30 @@ def deduplicate_final_papers(papers: List[dict], target_count: int):
     return kept, duplicates_removed
 
 
+def _paper_inline_citation(p: dict) -> str:
+    authors = str(p.get("authors", "") or "").strip()
+    year = str(p.get("year", "Unknown year") or "Unknown year").strip()
+    author_parts = [a.strip() for a in authors.split(",") if a.strip()]
+    surnames = []
+    for part in author_parts[:3]:
+        tokens = [t for t in re.split(r"\s+", part) if t]
+        if tokens:
+            surnames.append(tokens[-1])
+    if not surnames:
+        return f"Unknown, {year}"
+    if len(surnames) == 1:
+        return f"{surnames[0]}, {year}"
+    if len(surnames) == 2:
+        return f"{surnames[0]} & {surnames[1]}, {year}"
+    return f"{surnames[0]} et al., {year}"
+
+
 def build_paper_text(papers: List[dict]) -> str:
     blocks = []
-    for p in papers:
+    for idx, p in enumerate(papers, start=1):
         blocks.append(
+            f"Paper ID: {idx}\n"
+            f"Preferred inline citation: {_paper_inline_citation(p)}\n"
             f"Title: {p.get('title', '')}\n"
             f"Authors: {p.get('authors', '')}\n"
             f"Year: {p.get('year', '')}\n"
@@ -285,6 +317,7 @@ def clear_downstream_outputs_after_retrieval(state: dict):
     state["gap_analyst"] = {}
     state["verifier"] = {}
     state["editor"] = ""
+    state["editor_error"] = ""
     state["flags"]["analysis_bundle_done"] = False
 
 
@@ -672,6 +705,7 @@ def create_initial_state(
         "gap_analyst": {},
         "verifier": {},
         "editor": "",
+        "editor_error": "",
         "flags": {
             "planning_done": False,
             "planner_review_done": False,
@@ -693,7 +727,7 @@ def create_initial_state(
 
 
 def query_planner_initial_agent(state: dict, progress_callback=None) -> dict:
-    _emit(progress_callback, 8, "Query Planner Agent: planning retrieval and analysis route...")
+    _emit_progress(progress_callback, 8, "Query Planner Agent: planning retrieval and analysis route...")
 
     result = cached_run_query_planner_initial(
         state["original_query"],
@@ -714,7 +748,7 @@ def query_planner_initial_agent(state: dict, progress_callback=None) -> dict:
 
 
 def query_planner_review_agent(state: dict, progress_callback=None) -> dict:
-    _emit(progress_callback, 84, "Query Planner Agent: reviewing retrieval quality...")
+    _emit_progress(progress_callback, 84, "Query Planner Agent: reviewing retrieval quality...")
 
     compact_papers = []
     for p in state.get("papers", [])[:15]:
@@ -774,7 +808,7 @@ def retrieval_agent(state: dict, progress_callback=None, refinement: bool = Fals
 
         state["flags"]["retrieval_refined"] = True
 
-    _emit(
+    _emit_progress(
         progress_callback,
         16 if not refinement else 52,
         "Retrieval Agent: searching academic sources..." if not refinement else "Retrieval Agent: refining retrieval..."
@@ -827,7 +861,7 @@ def retrieval_agent(state: dict, progress_callback=None, refinement: bool = Fals
 
 
 def researcher_agent(state: dict, progress_callback=None) -> dict:
-    _emit(progress_callback, 88, "Researcher Agent: mapping the literature...")
+    _emit_progress(progress_callback, 88, "Researcher Agent: mapping the literature...")
     paper_text = build_paper_text(state.get("papers", []))
     result = cached_run_researcher(
         state["original_query"],
@@ -840,7 +874,7 @@ def researcher_agent(state: dict, progress_callback=None) -> dict:
 
 
 def theorist_agent(state: dict, progress_callback=None) -> dict:
-    _emit(progress_callback, 90, "Theorist Agent: building conceptual framing...")
+    _emit_progress(progress_callback, 90, "Theorist Agent: building conceptual framing...")
     paper_text = build_paper_text(state.get("papers", []))
     result = cached_run_theorist(
         state["original_query"],
@@ -853,7 +887,7 @@ def theorist_agent(state: dict, progress_callback=None) -> dict:
 
 
 def methodologist_agent(state: dict, progress_callback=None) -> dict:
-    _emit(progress_callback, 92, "Methodologist Agent: reading the evidence profile...")
+    _emit_progress(progress_callback, 92, "Methodologist Agent: reading the evidence profile...")
     paper_text = build_paper_text(state.get("papers", []))
     result = cached_run_methodologist(
         state["original_query"],
@@ -866,7 +900,7 @@ def methodologist_agent(state: dict, progress_callback=None) -> dict:
 
 
 def critic_agent(state: dict, progress_callback=None) -> dict:
-    _emit(progress_callback, 94, "Critic Agent: checking scope and overclaim risks...")
+    _emit_progress(progress_callback, 94, "Critic Agent: checking scope and overclaim risks...")
     paper_text = build_paper_text(state.get("papers", []))
     result = cached_run_critic(
         state["original_query"],
@@ -879,7 +913,7 @@ def critic_agent(state: dict, progress_callback=None) -> dict:
 
 
 def gap_agent(state: dict, progress_callback=None) -> dict:
-    _emit(progress_callback, 96, "Gap Agent: identifying research gaps...")
+    _emit_progress(progress_callback, 96, "Gap Agent: identifying research gaps...")
     paper_text = build_paper_text(state.get("papers", []))
     result = cached_run_gap_analyst(
         state["original_query"],
@@ -896,7 +930,7 @@ def gap_agent(state: dict, progress_callback=None) -> dict:
 
 
 def verifier_agent(state: dict, progress_callback=None) -> dict:
-    _emit(progress_callback, 97, "Verifier Agent: checking evidence confidence...")
+    _emit_progress(progress_callback, 97, "Verifier Agent: checking evidence confidence...")
     paper_text = build_paper_text(state.get("papers", []))
     result = cached_run_verifier(
         state["original_query"],
@@ -924,7 +958,7 @@ def parallel_analysis_agent(state: dict, progress_callback=None) -> dict:
     # Otherwise users see an empty block when planner heuristics skip it.
     should_use_theorist = True
 
-    _emit(progress_callback, 90, "Parallel analysis wave 1/3: independent Researcher and Methodologist reviews...")
+    _emit_progress(progress_callback, 90, "Parallel analysis wave 1/3: independent Researcher and Methodologist reviews...")
 
     wave1_jobs = {
         "researcher": lambda: run_researcher(
@@ -958,7 +992,7 @@ def parallel_analysis_agent(state: dict, progress_callback=None) -> dict:
     add_trace(state, "MethodologistAgent", "parallel_complete", "wave1 independent review complete", progress_callback=progress_callback)
 
     if should_use_theorist:
-        _emit(progress_callback, 92, "Parallel analysis wave 2/3: independent Theorist and Critic reviews...")
+        _emit_progress(progress_callback, 92, "Parallel analysis wave 2/3: independent Theorist and Critic reviews...")
 
         wave2_jobs = {
             "theorist": lambda: run_theorist(
@@ -973,7 +1007,7 @@ def parallel_analysis_agent(state: dict, progress_callback=None) -> dict:
             ),
         }
     else:
-        _emit(progress_callback, 92, "Parallel analysis wave 2/3: independent Critic review...")
+        _emit_progress(progress_callback, 92, "Parallel analysis wave 2/3: independent Critic review...")
         wave2_jobs = {
             "critic": lambda: run_critic(
                 state["original_query"],
@@ -1003,48 +1037,32 @@ def parallel_analysis_agent(state: dict, progress_callback=None) -> dict:
 
     state["critic"] = wave2_results.get("critic", {})
     add_trace(state, "CriticAgent", "parallel_complete", "wave2 independent review complete", progress_callback=progress_callback)
+    _emit_progress(progress_callback, 95, "Parallel analysis wave 3/3: Gap Analyst and Verifier integration...")
 
-    _emit(progress_callback, 95, "Parallel analysis wave 3/3: Gap Analyst and Verifier integration...")
+    gap_result = run_gap_analyst(
+        state["original_query"],
+        state["final_search_query"],
+        paper_text,
+        state.get("researcher", {}),
+        state.get("theorist", {}),
+        state.get("methodologist", {}),
+        state.get("critic", {}),
+    )
+    state["gap_analyst"] = gap_result
+    add_trace(state, "GapAgent", "parallel_complete", "wave3 gap analysis complete", progress_callback=progress_callback)
 
-    wave3_jobs = {
-        "gap_analyst": lambda: run_gap_analyst(
-            state["original_query"],
-            state["final_search_query"],
-            paper_text,
-            state.get("researcher", {}),
-            state.get("theorist", {}),
-            state.get("methodologist", {}),
-            state.get("critic", {}),
-        ),
-        "verifier": lambda: run_verifier(
-            state["original_query"],
-            state["final_search_query"],
-            paper_text,
-            state.get("researcher", {}),
-            state.get("theorist", {}),
-            state.get("methodologist", {}),
-            state.get("critic", {}),
-            {},
-        ),
-    }
-
-    wave3_results = {}
-    with ThreadPoolExecutor(max_workers=len(wave3_jobs)) as executor:
-        future_map = {
-            executor.submit(_run_parallel_job, job_name, fn): job_name
-            for job_name, fn in wave3_jobs.items()
-        }
-        for future in as_completed(future_map):
-            job_name = future_map[future]
-            try:
-                wave3_results[job_name] = future.result()
-            except Exception as e:
-                raise RuntimeError(f"Parallel wave 3 failed in {job_name}: {e}") from e
-
-    state["gap_analyst"] = wave3_results.get("gap_analyst", {})
-    state["verifier"] = wave3_results.get("verifier", {})
-    add_trace(state, "GapAgent", "parallel_complete", "wave3 integration complete", progress_callback=progress_callback)
-    add_trace(state, "VerifierAgent", "parallel_complete", f"wave3 integration complete, confidence={state['verifier'].get('confidence_level', 'Medium')}", progress_callback=progress_callback)
+    verifier_result = run_verifier(
+        state["original_query"],
+        state["final_search_query"],
+        paper_text,
+        state.get("researcher", {}),
+        state.get("theorist", {}),
+        state.get("methodologist", {}),
+        state.get("critic", {}),
+        state.get("gap_analyst", {}),
+    )
+    state["verifier"] = verifier_result
+    add_trace(state, "VerifierAgent", "parallel_complete", f"wave3 verification complete, confidence={state['verifier'].get('confidence_level', 'Medium')}", progress_callback=progress_callback)
 
     state["flags"]["analysis_bundle_done"] = True
     add_trace(state, "ParallelAnalysisAgent", "complete", "post-retrieval independent reviews and integration finished", progress_callback=progress_callback)
@@ -1052,7 +1070,7 @@ def parallel_analysis_agent(state: dict, progress_callback=None) -> dict:
 
 
 def editor_agent(state: dict, progress_callback=None) -> dict:
-    _emit(progress_callback, 98, "Editor Agent: building final Research Brief...")
+    _emit_progress(progress_callback, 98, "Editor Agent: building final Research Brief...")
     paper_text = build_paper_text(state.get("papers", []))
     strategy_summary = build_strategy_summary_for_editor(state)
 
@@ -1068,8 +1086,13 @@ def editor_agent(state: dict, progress_callback=None) -> dict:
         _safe_json_dumps(state.get("verifier", {})),
         _safe_json_dumps(strategy_summary),
     )
-    state["editor"] = result
-    add_trace(state, "EditorAgent", "synthesize", "final brief built", progress_callback=progress_callback)
+    if isinstance(result, dict):
+        state["editor"] = str(result.get("brief", "") or "").strip()
+        state["editor_error"] = str(result.get("error", "") or "").strip()
+    else:
+        state["editor"] = str(result or "").strip()
+        state["editor_error"] = ""
+    add_trace(state, "EditorAgent", "synthesize", "final brief built" if state.get("editor") else "final brief unavailable", progress_callback=progress_callback)
     return state
 
 
@@ -1278,7 +1301,13 @@ def run_multi_agent_collaboration(
         _emit(
             progress_callback,
             0,
-            f"RouterAgent: routing to {task.get('type')}..."
+            f"RouterAgent: routing to {task.get('type')}...",
+            payload={
+                "type": "workflow",
+                "agent": "RouterAgent",
+                "action": "route_status",
+                "details": f"routing to {task.get('type')}",
+            }
         )
         state = execute_task(state, task, progress_callback=progress_callback)
 
@@ -1287,5 +1316,5 @@ def run_multi_agent_collaboration(
         state = editor_agent(state, progress_callback=progress_callback)
 
     state["flags"]["done"] = True
-    _emit(progress_callback, 100, "Multi-agent collaboration complete.")
+    _emit_progress(progress_callback, 100, "Multi-agent collaboration complete.")
     return state
